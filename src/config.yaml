@@ -1,0 +1,52 @@
+model:
+  name: "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
+  max_seq_length: 1024
+  dtype: "float16" # or float16, bfloat16
+  load_in_4bit: true
+
+dataset:
+  path: "openai/gsm8k"
+  train_test_split:
+    test_size: 0.1
+    shuffle: true
+    seed: 501
+
+training:
+  per_device_train_batch_size: 16
+  gradient_accumulation_steps: 1
+  optim: "adamw_8bit"
+  learning_rate: 3.0e-4
+  weight_decay: 0.01
+  lr_scheduler_type: "cosine"
+  warmup_steps: 100
+  logging_steps: 10
+  num_train_epochs: 5
+  max_steps: -1
+  max_grad_norm: 1.0
+  fp16: true
+  bf16: false
+  eval_strategy: "steps"
+  eval_steps: 10
+  save_strategy: "steps"
+  save_steps: 10
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  push_to_hub: false
+  report_to: "tensorboard"
+  early_stopping:
+    enabled: true
+    patience: 3
+    threshold: 0.0
+
+peft:
+  r: 32
+  lora_alpha: 32
+  lora_dropout: 0.05
+  bias: "none"
+  use_gradient_checkpointing: true
+  random_state: 3407
+
+output:
+  output_dir: "/app/output"
+  save_dataset: false
+  save_config: true
