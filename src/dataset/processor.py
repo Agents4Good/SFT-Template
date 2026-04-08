@@ -1,6 +1,6 @@
 from datasets import load_dataset, Dataset
 from core.base import AbstractDatasetProcessor
-from prompts import user_prompt, model_prompt
+from prompts.train_prompts import user_prompt, model_prompt
 
 class DatasetProcessor(AbstractDatasetProcessor):
     def __init__(self, config, tokenizer):
