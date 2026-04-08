@@ -1,9 +1,8 @@
-from model.handler import Model
-from dataset.processor import DatasetProcessor
+from src.model.handler import Model
+from src.dataset.processor import DatasetProcessor
 import yaml
 import argparse
-from model.handler import Model
-from dataset.processor import DatasetProcessor
+from src.model.handler import Model
 
 def load_config(path):
     """
