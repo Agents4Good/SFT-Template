@@ -42,7 +42,7 @@ class Model:
         self.model = FastLanguageModel.get_peft_model(
             self.model,
             r=self.config['peft']['r'],
-            lora_alpha=self.config['peft']['lora_alpha'],
+            lora_alpha=self.config['peft']['r'],
             lora_dropout=self.config['peft']['lora_dropout'],
             bias=self.config['peft']['bias'],
             use_gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
