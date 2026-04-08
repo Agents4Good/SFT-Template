@@ -84,7 +84,7 @@ class SFTTrain(AbstractSFTTrain):
             weight_decay=training_config['weight_decay'],
             lr_scheduler_type=training_config['lr_scheduler_type'],
             warmup_steps=training_config['warmup_steps'],
-            logging_steps=training_config['logging_steps'],
+            logging_steps=10,
             num_train_epochs=training_config['num_train_epochs'],
             max_steps=training_config['max_steps'],
             fp16=training_config['fp16'],

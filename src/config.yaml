@@ -19,7 +19,6 @@ training:
   weight_decay: 0.01
   lr_scheduler_type: "cosine"
   warmup_steps: 100
-  logging_steps: 10
   num_train_epochs: 5
   max_steps: -1
   max_grad_norm: 1.0
