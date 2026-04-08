@@ -20,13 +20,13 @@ def load_config(path):
 def calculate_tokens_usage(model:Model, dataset) -> int:
     tokenizer = model.get_tokenizer()
 
-    tokens = list()
+    tokens_length = list()
     for example in dataset:
         text = example['text']
         tokens = tokenizer.tokenize(text)
-        tokens.append(len(tokens))
+        tokens_length.append(len(tokens))
 
-    return max(tokens)
+    return max(tokens_length)
 
 def main():
     parser = argparse.ArgumentParser(description="Run SFT Training")
