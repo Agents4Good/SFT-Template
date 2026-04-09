@@ -11,9 +11,9 @@ This script orchestrates the Supervised Fine-Tuning (SFT) process by:
 
 import yaml
 import argparse
-from model.handler import Model
-from dataset.processor import DatasetProcessor
-from train.sft import SFTTrain
+from src.model.handler import Model
+from src.dataset.processor import DatasetProcessor
+from src.train.sft import SFTTrain
 
 def load_config(path):
     """
