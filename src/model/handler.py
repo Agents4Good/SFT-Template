@@ -1,30 +1,14 @@
 from unsloth import FastLanguageModel
+from src.core.base import AbstractModel
 import torch
 
-class Model:
-    """
-    Handles model loading and configuration using Unsloth.
-    
-    This class is responsible for initializing the pre-trained model and tokenizer,
-    applying PEFT/LoRA configurations, and providing access to the loaded model.
-    """
-
+class Model(AbstractModel):
     def __init__(self, config):
-        """
-        Initializes the Model handler with the project configuration.
-        
-        Args:
-            config (dict): Configuration dictionary containing model and PEFT parameters.
-        """
         self.config = config
         self.model = None
         self.tokenizer = None
 
     def load_model(self):
-        """
-        Loads the pre-trained model and applies PEFT configurations.
-        Uses FastLanguageModel for efficient loading and training.
-        """
         max_seq_length = self.config['model']['max_seq_length']
         dtype = getattr(torch, self.config['model']['dtype']) if hasattr(torch, self.config['model']['dtype']) else None
         load_in_4bit = self.config['model']['load_in_4bit']

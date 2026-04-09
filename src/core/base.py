@@ -66,3 +66,29 @@ class AbstractSFTTrain(ABC):
         Saves the fine-tuned model and configuration.
         """
         pass
+
+class AbstractModel(ABC):
+    """
+    Handles model loading and configuration using Unsloth.
+    
+    This class is responsible for initializing the pre-trained model and tokenizer,
+    applying PEFT/LoRA configurations, and providing access to the loaded model.
+    """
+    
+    @abstractmethod
+    def load_model(self):
+        """
+        Loads the pre-trained model and applies PEFT configurations.
+        Uses FastLanguageModel for efficient loading and training.
+        """
+        pass
+
+    @abstractmethod
+    def get_model(self):
+        """Returns the loaded model instance."""
+        pass
+
+    @abstractmethod
+    def get_tokenizer(self):
+        """Returns the loaded tokenizer instance."""
+        pass
