@@ -1,5 +1,5 @@
 from datasets import load_dataset, Dataset
-from src.core.base import AbstractDatasetProcessor
+from src.core.base import AbstractDatasetProcessor, AbstractModel
 from src.prompts.train_prompts import user_prompt, model_prompt
 
 class DatasetProcessor(AbstractDatasetProcessor):
@@ -46,3 +46,15 @@ class DatasetProcessor(AbstractDatasetProcessor):
 
     def save_dataset(self, dataset, path):
         dataset.save_to_disk(path)
+
+    def calculate_tokens_usage(self, model:AbstractModel, dataset) -> list:
+        tokenizer = model.get_tokenizer()
+
+        tokens_length = list()
+        for example in dataset:
+            text = example['text']
+            tokens = tokenizer.tokenize(text)
+            tokens_length.append(len(tokens))
+
+        return tokens_length
+

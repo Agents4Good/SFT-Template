@@ -17,7 +17,7 @@ def load_config(path):
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
-def calculate_tokens_usage(model:Model, dataset) -> int:
+def calculate_tokens_usage(model:Model, dataset) -> list:
     tokenizer = model.get_tokenizer()
 
     tokens_length = list()
@@ -26,7 +26,7 @@ def calculate_tokens_usage(model:Model, dataset) -> int:
         tokens = tokenizer.tokenize(text)
         tokens_length.append(len(tokens))
 
-    return max(tokens_length)
+    return tokens_length
 
 def main():
     parser = argparse.ArgumentParser(description="Run SFT Training")
