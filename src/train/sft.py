@@ -1,6 +1,6 @@
 from trl import SFTTrainer
 from transformers import TrainingArguments, EarlyStoppingCallback
-from core.base import AbstractSFTTrain
+from src.core.base import AbstractSFTTrain
 import datetime
 import os
 import ast
