@@ -1,6 +1,7 @@
 from datasets import load_dataset, Dataset
 from src.core.base import AbstractDatasetProcessor, AbstractModel
 from src.prompts.train_prompts import user_prompt, model_prompt
+from transformers import AutoTokenizer
 
 class DatasetProcessor(AbstractDatasetProcessor):
     def __init__(self, config, tokenizer):
@@ -47,8 +48,8 @@ class DatasetProcessor(AbstractDatasetProcessor):
     def save_dataset(self, dataset, path):
         dataset.save_to_disk(path)
 
-    def calculate_tokens_usage(self, model:AbstractModel, dataset) -> list:
-        tokenizer = model.get_tokenizer()
+    def calculate_tokens_usage(self, dataset) -> list:
+        tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
 
         tokens_length = list()
         for example in dataset:
