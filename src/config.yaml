@@ -23,10 +23,8 @@ training:
   max_grad_norm: 1.0
   fp16: true
   bf16: false
-  eval_strategy: "steps"
-  eval_steps: 10
-  save_strategy: "steps"
-  save_steps: 10
+  eval_save_strategy: "steps"
+  eval_save_steps: 10
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   push_to_hub: false
