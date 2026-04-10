@@ -99,10 +99,20 @@ def optimize_training_params(vram_metrics, target_vram_gb, global_batch_size):
     # Calculate how many samples we can fit in the remaining VRAM
     max_per_device_batch = int(available_vram_gb // activation_per_sample_gb)
     
-    # Clip by global_batch_size and ensure at least 1
-    per_device_train_batch_size = max(1, min(max_per_device_batch, global_batch_size))
+    if max_per_device_batch >= global_batch_size:
+        return global_batch_size, 1
+        
+    # Ensure at least 1
+    max_per_device_batch = max(1, max_per_device_batch)
+    
+    # Find the largest divisor of global_batch_size that is <= max_per_device_batch
+    per_device_train_batch_size = 1
+    for d in range(max_per_device_batch, 0, -1):
+        if global_batch_size % d == 0:
+            per_device_train_batch_size = d
+            break
     
     # Calculate gradient accumulation steps
-    gradient_accumulation_steps = (global_batch_size + per_device_train_batch_size - 1) // per_device_train_batch_size
+    gradient_accumulation_steps = global_batch_size // per_device_train_batch_size
     
     return per_device_train_batch_size, gradient_accumulation_steps

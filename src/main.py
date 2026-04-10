@@ -49,11 +49,13 @@ def main():
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
     
-    if config["model"]["max_seq_length"] is None:
+    if config["model"].get("max_seq_length") is None:
         print("Calculating max sequence length from dataset...")
-        max_seq_length = dataset_processor.calculate_tokens_usage(formatted_dataset)
-        config["model"]["max_seq_length"] = max(max_seq_length)
+        max_seq_lengths = dataset_processor.calculate_tokens_usage(formatted_dataset)
+        config["model"]["max_seq_length"] = max(max_seq_lengths)
         print(f"Max sequence length set to: {config['model']['max_seq_length']}")
+    else:
+        print(f"Using max sequence length from config: {config['model']['max_seq_length']}")
 
     # 2. Model Initialization
     print("-" * 10 + "Loading model" + "-" * 10)

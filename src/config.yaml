@@ -12,8 +12,6 @@ dataset:
     seed: 501
 
 training:
-  per_device_train_batch_size: 1
-  gradient_accumulation_steps: 1
   global_batch_size: 64
   optim: "adamw_8bit"
   learning_rate: 3.0e-4
