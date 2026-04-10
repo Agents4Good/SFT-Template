@@ -43,8 +43,8 @@ def main():
     print("Processing Dataset...")
     dataset_processor = DatasetProcessor(config)
     raw_dataset = dataset_processor.load_dataset()
-    max_seq_length = dataset_processor.calculate_tokens_usage(raw_dataset)
     formatted_dataset = dataset_processor.format_dataset(raw_dataset)
+    max_seq_length = dataset_processor.calculate_tokens_usage(formatted_dataset)
     split_dataset = dataset_processor.split_dataset(formatted_dataset)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
