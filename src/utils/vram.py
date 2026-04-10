@@ -73,3 +73,36 @@ def estimate_vram_usage(
     }
     
     return metrics
+
+def optimize_training_params(vram_metrics, target_vram_gb, global_batch_size):
+    """
+    Calculates the optimal micro-batch size and gradient accumulation steps.
+    
+    Args:
+        vram_metrics (dict): Metrics from estimate_vram_usage.
+        target_vram_gb (float): Target VRAM usage in GB.
+        global_batch_size (int): Desired global batch size.
+        
+    Returns:
+        tuple: (per_device_train_batch_size, gradient_accumulation_steps)
+    """
+    static_vram_gb = vram_metrics["total_static_gb"]
+    activation_per_sample_gb = vram_metrics["activations_per_sample_gb"]
+    
+    available_vram_gb = target_vram_gb - static_vram_gb
+    
+    if available_vram_gb <= 0:
+        # Static part alone exceeds budget or very close to it.
+        # Fall back to minimum micro-batch size.
+        return 1, global_batch_size
+        
+    # Calculate how many samples we can fit in the remaining VRAM
+    max_per_device_batch = int(available_vram_gb // activation_per_sample_gb)
+    
+    # Clip by global_batch_size and ensure at least 1
+    per_device_train_batch_size = max(1, min(max_per_device_batch, global_batch_size))
+    
+    # Calculate gradient accumulation steps
+    gradient_accumulation_steps = (global_batch_size + per_device_train_batch_size - 1) // per_device_train_batch_size
+    
+    return per_device_train_batch_size, gradient_accumulation_steps

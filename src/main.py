@@ -14,6 +14,7 @@ import argparse
 from src.model.handler import Model
 from src.dataset.processor import DatasetProcessor
 from src.train.sft import SFTTrain
+from src.utils.vram import estimate_vram_usage
 
 def load_config(path):
     """
@@ -61,8 +62,8 @@ def main():
     model = model_handler.get_model()
     tokenizer = model_handler.get_tokenizer()
     
-    # Estimate VRAM usage
-    from src.utils.vram import estimate_vram_usage
+    # Optimize training parameters
+    from src.utils.vram import estimate_vram_usage, optimize_training_params
     
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -77,12 +78,26 @@ def main():
         optimizer=config["training"]["optim"]
     )
     
-    print("-" * 10 + "Memory Estimate (Per Unit)" + "-" * 10)
+    # Calculate optimal batch size and accumulation steps
+    per_device_batch, grad_accum = optimize_training_params(
+        vram_metrics=vram_metrics,
+        target_vram_gb=config["model"]["target_total_vram_gb"],
+        global_batch_size=config["training"]["global_batch_size"]
+    )
+    
+    # Update config with optimized values
+    config["training"]["per_device_train_batch_size"] = per_device_batch
+    config["training"]["gradient_accumulation_steps"] = grad_accum
+    
+    print("-" * 10 + "Memory & Batch Optimization" + "-" * 10)
     print(f"Total Params: {total_params:,}")
     print(f"Trainable Params: {trainable_params:,}")
-    print(f"Fixed Memory (Weights + Grads + Opt): {vram_metrics['total_static_gb']} GB")
+    print(f"Fixed Memory: {vram_metrics['total_static_gb']} GB")
     print(f"Activation Memory (per sample): {vram_metrics['activations_per_sample_gb']} GB")
-    print(f"Total Estimated per Sample: {vram_metrics['total_per_sample_gb']} GB")
+    print(f"Target VRAM: {config['model']['target_total_vram_gb']} GB")
+    print(f"Optimized per_device_train_batch_size: {per_device_batch}")
+    print(f"Optimized gradient_accumulation_steps: {grad_accum}")
+    print(f"Effective Global Batch Size: {per_device_batch * grad_accum}")
     print("-" * 30)
 
     # 3. Training Execution
