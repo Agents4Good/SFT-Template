@@ -4,9 +4,9 @@ from src.prompts.train_prompts import user_prompt, model_prompt
 from transformers import AutoTokenizer
 
 class DatasetProcessor(AbstractDatasetProcessor):
-    def __init__(self, config, tokenizer):
+    def __init__(self, config):
         self.config = config
-        self.tokenizer = tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
 
     def load_dataset(self, path=None):
         dataset_path = path if path else self.config['dataset']['path']
@@ -49,12 +49,10 @@ class DatasetProcessor(AbstractDatasetProcessor):
         dataset.save_to_disk(path)
 
     def calculate_tokens_usage(self, dataset) -> list:
-        tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
-
         tokens_length = list()
         for example in dataset:
             text = example['text']
-            tokens = tokenizer.tokenize(text)
+            tokens = self.tokenizer.tokenize(text)
             tokens_length.append(len(tokens))
 
         return tokens_length

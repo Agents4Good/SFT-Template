@@ -1,7 +1,6 @@
 model:
   name: "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
-  max_seq_length: 1024
-  dtype: "float16" # or float16, bfloat16
+  dtype: "float16"
   load_in_4bit: true
 
 dataset:

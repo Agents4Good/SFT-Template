@@ -38,23 +38,26 @@ def main():
     args = parser.parse_args()
 
     config = load_config(args.config)
-
-    # 1. Model Initialization
-    print("Loading Model...")
-    model_handler = Model(config)
-    model_handler.load_model()
-    model = model_handler.get_model()
-    tokenizer = model_handler.get_tokenizer()
-
-    # 2. Dataset Processing
+    
+    # 1. Dataset Processing
     print("Processing Dataset...")
-    dataset_processor = DatasetProcessor(config, tokenizer)
+    dataset_processor = DatasetProcessor(config)
     raw_dataset = dataset_processor.load_dataset()
+    max_seq_length = dataset_processor.calculate_tokens_usage(raw_dataset)
     formatted_dataset = dataset_processor.format_dataset(raw_dataset)
     split_dataset = dataset_processor.split_dataset(formatted_dataset)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
 
+    config["model"]["max_seq_length"] = max(max_seq_length)
+
+    # 2. Model Initialization
+    print("Loading Model...")
+    model_handler = Model(config)
+    model_handler.load_model()
+    model = model_handler.get_model()
+    tokenizer = model_handler.get_tokenizer()
+    
     # 3. Training Execution
     print("Starting Training...")
     trainer = SFTTrain(config, model, tokenizer, train_dataset, eval_dataset)
