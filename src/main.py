@@ -40,31 +40,37 @@ def main():
     config = load_config(args.config)
     
     # 1. Dataset Processing
-    print("Processing Dataset...")
+    print("-" * 10 + "Processing Dataset" + "-" * 10)
     dataset_processor = DatasetProcessor(config)
     raw_dataset = dataset_processor.load_dataset()
     formatted_dataset = dataset_processor.format_dataset(raw_dataset)
-    max_seq_length = dataset_processor.calculate_tokens_usage(formatted_dataset)
     split_dataset = dataset_processor.split_dataset(formatted_dataset)
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
-
-    config["model"]["max_seq_length"] = max(max_seq_length)
+    
+    if config["model"]["max_seq_length"] is None:
+        print("Calculating max sequence length from dataset...")
+        max_seq_length = dataset_processor.calculate_tokens_usage(formatted_dataset)
+        config["model"]["max_seq_length"] = max(max_seq_length)
+        print(f"Max sequence length set to: {config['model']['max_seq_length']}")
 
     # 2. Model Initialization
-    print("Loading Model...")
+    print("-" * 10 + "Loading model" + "-" * 10)
     model_handler = Model(config)
     model_handler.load_model()
     model = model_handler.get_model()
     tokenizer = model_handler.get_tokenizer()
     
     # 3. Training Execution
-    print("Starting Training...")
+    print("-" * 10 + "Starting training" + "-" * 10)
     trainer = SFTTrain(config, model, tokenizer, train_dataset, eval_dataset)
     trainer.train()
     
     # 4. Persistence
+    print("-" * 10 + "Saving model" + "-" * 10)
     trainer.save_model()
+
+    print("Training completed successfully!")
 
 if __name__ == "__main__":
     main()
