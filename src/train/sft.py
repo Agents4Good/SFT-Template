@@ -73,6 +73,11 @@ class SFTTrain(AbstractSFTTrain):
         if self.config['output']['save_dataset'] and os.path.exists(self.config['dataset']['path']):
             shutil.copy2(self.config['dataset']['path'], self.final_path)
         
+        # Deduce precision from dtype
+        dtype_str = self.config['model'].get('dtype', 'float32')
+        fp16_val = dtype_str == 'float16'
+        bf16_val = dtype_str == 'bfloat16'
+        
         # Initialize training arguments from configuration
         args = TrainingArguments(
             output_dir=self.final_path,
@@ -81,14 +86,14 @@ class SFTTrain(AbstractSFTTrain):
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
             optim=training_config['optim'],
             learning_rate=float(training_config['learning_rate']),
-            weight_decay=training_config['weight_decay'],
+            weight_decay=0.01,
             lr_scheduler_type=training_config['lr_scheduler_type'],
             warmup_steps=training_config['warmup_steps'],
             logging_steps=10,
             num_train_epochs=training_config['num_train_epochs'],
             max_steps=training_config['max_steps'],
-            fp16=training_config['fp16'],
-            bf16=training_config['bf16'],
+            fp16=fp16_val,
+            bf16=bf16_val,
             eval_strategy=training_config['eval_save_strategy'],
             eval_steps=training_config['eval_save_steps'],
             save_strategy=training_config['eval_save_strategy'],
@@ -98,7 +103,6 @@ class SFTTrain(AbstractSFTTrain):
             push_to_hub=training_config['push_to_hub'],
             report_to=training_config['report_to'],
             gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
-            max_grad_norm=training_config['max_grad_norm'],
         )
 
         callbacks = []

@@ -41,8 +41,8 @@ class DatasetProcessor(AbstractDatasetProcessor):
         split_config = self.config['dataset']['train_test_split']
         return dataset.train_test_split(
             test_size=split_config['test_size'], 
-            shuffle=split_config['shuffle'], 
-            seed=split_config['seed']
+            shuffle=True, 
+            seed=42
         )
 
     def save_dataset(self, dataset, path):

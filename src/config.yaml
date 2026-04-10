@@ -8,21 +8,15 @@ dataset:
   path: "openai/gsm8k"
   train_test_split:
     test_size: 0.1
-    shuffle: true
-    seed: 501
 
 training:
   global_batch_size: 64
   optim: "adamw_8bit"
   learning_rate: 3.0e-4
-  weight_decay: 0.01
   lr_scheduler_type: "cosine"
   warmup_steps: 100
   num_train_epochs: 5
   max_steps: -1
-  max_grad_norm: 1.0
-  fp16: true
-  bf16: false
   eval_save_strategy: "steps"
   eval_save_steps: 10
   load_best_model_at_end: true
@@ -36,10 +30,7 @@ training:
 
 peft:
   r: 32
-  lora_dropout: 0.05
-  bias: "none"
   use_gradient_checkpointing: true
-  random_state: 3407
 
 output:
   output_dir: "/app/output"

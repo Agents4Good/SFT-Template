@@ -27,10 +27,10 @@ class Model(AbstractModel):
             self.model,
             r=self.config['peft']['r'],
             lora_alpha=self.config['peft']['r'],
-            lora_dropout=self.config['peft']['lora_dropout'],
-            bias=self.config['peft']['bias'],
+            lora_dropout=0,
+            bias="none",
             use_gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
-            random_state=self.config['peft']['random_state'],
+            random_state=42,
         )
     
     def get_model(self):
