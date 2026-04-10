@@ -61,6 +61,30 @@ def main():
     model = model_handler.get_model()
     tokenizer = model_handler.get_tokenizer()
     
+    # Estimate VRAM usage
+    from src.utils.vram import estimate_vram_usage
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    vram_metrics = estimate_vram_usage(
+        model_name=config["model"]["name"],
+        total_params=total_params,
+        trainable_params=trainable_params,
+        dtype=config["model"]["dtype"],
+        load_in_4bit=config["model"]["load_in_4bit"],
+        max_seq_length=config["model"]["max_seq_length"],
+        optimizer=config["training"]["optim"]
+    )
+    
+    print("-" * 10 + "Memory Estimate (Per Unit)" + "-" * 10)
+    print(f"Total Params: {total_params:,}")
+    print(f"Trainable Params: {trainable_params:,}")
+    print(f"Fixed Memory (Weights + Grads + Opt): {vram_metrics['total_static_gb']} GB")
+    print(f"Activation Memory (per sample): {vram_metrics['activations_per_sample_gb']} GB")
+    print(f"Total Estimated per Sample: {vram_metrics['total_per_sample_gb']} GB")
+    print("-" * 30)
+
     # 3. Training Execution
     print("-" * 10 + "Starting training" + "-" * 10)
     trainer = SFTTrain(config, model, tokenizer, train_dataset, eval_dataset)
