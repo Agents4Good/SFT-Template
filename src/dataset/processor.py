@@ -6,7 +6,9 @@ from transformers import AutoTokenizer
 class DatasetProcessor(AbstractDatasetProcessor):
     def __init__(self, config):
         self.config = config
+        print(f"The type is {type(self.config['model']['name'])}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
+        print(type(self.tokenizer))
 
     def load_dataset(self, path=None):
         dataset_path = path if path else self.config['dataset']['path']

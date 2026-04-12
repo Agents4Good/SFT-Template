@@ -1,5 +1,5 @@
-from trl import SFTTrainer
-from transformers import TrainingArguments, EarlyStoppingCallback
+from trl import SFTTrainer, SFTConfig
+from transformers import EarlyStoppingCallback
 from src.core.base import AbstractSFTTrain
 import datetime
 import os
@@ -79,9 +79,8 @@ class SFTTrain(AbstractSFTTrain):
         bf16_val = dtype_str == 'bfloat16'
         
         # Initialize training arguments from configuration
-        args = TrainingArguments(
+        args = SFTConfig(
             output_dir=self.final_path,
-            overwrite_output_dir=True,
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
             optim=training_config['optim'],
@@ -103,6 +102,8 @@ class SFTTrain(AbstractSFTTrain):
             push_to_hub=training_config['push_to_hub'],
             report_to=training_config['report_to'],
             gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
+            dataset_text_field="text",
+            max_seq_length=self.config['model']['max_seq_length'],
         )
 
         callbacks = []
@@ -118,8 +119,6 @@ class SFTTrain(AbstractSFTTrain):
             tokenizer=self.tokenizer,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
-            dataset_text_field="text",
-            max_seq_length=self.config['model']['max_seq_length'],
             args=args,
             packing=False,
             callbacks=callbacks,
