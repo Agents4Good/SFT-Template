@@ -1,8 +1,8 @@
 model:
-  name: "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
-  dtype: "float16"
+  name: "unsloth/gemma-4-E2B-it"
+  dtype: "bfloat16"
   load_in_4bit: true
-  target_total_vram_gb: 10.0
+  target_total_vram_gb: 5.0
 
 dataset:
   path: "openai/gsm8k"
@@ -16,7 +16,7 @@ training:
   lr_scheduler_type: "cosine"
   warmup_steps: 100
   num_train_epochs: 5
-  max_steps: -1
+  max_steps: 2
   eval_save_strategy: "steps"
   eval_save_steps: 10
   load_best_model_at_end: true
@@ -33,6 +33,6 @@ peft:
   use_gradient_checkpointing: true
 
 output:
-  output_dir: "/app/output"
+  output_dir: "./src/output"
   save_dataset: false
   save_config: true
