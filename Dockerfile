@@ -39,6 +39,7 @@ RUN python -m pip install --no-cache-dir --no-deps unsloth==2026.4.4 unsloth_zoo
 # --- THE CLEAN FIX ---
 # Register CUDA libraries for bitsandbytes
 RUN echo "/usr/local/cuda/lib64" > /etc/ld.so.conf.d/cuda.conf && ldconfig
+RUN rm -rf /usr/local/cuda/compat
 
 # Project setup
 COPY . .
