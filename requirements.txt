@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu124
+
 accelerate==1.13.0
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
@@ -10,9 +12,6 @@ bitsandbytes==0.49.2
 certifi==2026.2.25
 charset-normalizer==3.4.7
 click==8.3.2
-cuda-bindings==13.2.0
-cuda-pathfinder==1.5.2
-cuda-toolkit==13.0.2
 cut-cross-entropy==25.1.1
 datasets==4.8.4
 diffusers==0.37.1
@@ -40,25 +39,6 @@ multiprocess==0.70.19
 nest-asyncio==1.6.0
 networkx==3.6.1
 numpy==2.4.4
-nvidia-cublas==13.1.0.3
-nvidia-cuda-cccl==13.2.27
-nvidia-cuda-crt==13.2.51
-nvidia-cuda-cupti==13.0.85
-nvidia-cuda-nvcc==13.2.51
-nvidia-cuda-nvrtc==13.0.88
-nvidia-cuda-runtime==13.0.96
-nvidia-cudnn-cu13==9.19.0.56
-nvidia-cufft==12.0.0.61
-nvidia-cufile==1.15.1.6
-nvidia-curand==10.4.0.35
-nvidia-cusolver==12.0.4.66
-nvidia-cusparse==12.6.3.3
-nvidia-cusparselt-cu13==0.8.0
-nvidia-nccl-cu13==2.28.9
-nvidia-nvjitlink==13.0.88
-nvidia-nvshmem-cu13==3.4.5
-nvidia-nvtx==13.0.85
-nvidia-nvvm==13.2.51
 packaging==26.0
 pandas==3.0.2
 peft==0.18.1
