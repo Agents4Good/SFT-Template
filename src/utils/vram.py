@@ -53,12 +53,23 @@ def estimate_vram_usage(
         # Standard Adam/AdamW uses 8 bytes per trainable parameter for moments
         opt_vram = trainable_params * 8
         
-    # 4. Activation Memory (Rough estimate per unit sample)
-    # Heuristic: ~2 * layers * hidden_size * seq_len * bytes
-    # For many models, total_params is approx 12 * layers * hidden^2.
-    # We can approximate hidden_size * layers as a factor of total_params.
-    # A safe rule of thumb for gradient checkpointing is ~0.1-0.5 MB per token for 1B-7B models.
-    activation_vram_per_sample = max_seq_length * (total_params / 1e6) * 0.4 * 1024
+    # 4. Activation Memory (Estimate per unit sample)
+    # Refined heuristic: accounts for quadratic attention and constant overhead.
+    # Linear part: ~1.2 * layers * hidden * seq_len
+    # Quadratic part (attention): ~2 * layers * num_heads * seq_len^2
+    # Simplified approximation for models like Gemma:
+    # 0.8 bytes per token per million params (linear) + quadratic scaling for attention.
+    
+    # Linear component (memory used for MLP activations, etc.)
+    activation_vram_linear = max_seq_length * (total_params / 1e6) * 0.8 * 1024
+    
+    # Quadratic component (Self-Attention matrix)
+    # Approx 2 bytes * num_heads * seq_len^2 * layers
+    # We estimate num_heads * layers as roughly (total_params / (12 * hidden_size))
+    # For a rough model-agnostic estimate, we use 10e-9 multiplier for params * seq_len^2
+    activation_vram_quadratic = (total_params / 1e9) * (max_seq_length**2) * 50
+    
+    activation_vram_per_sample = activation_vram_linear + activation_vram_quadratic
     
     # Convert to GB
     to_gb = lambda x: round(x / (1024**3), 3)
@@ -86,10 +97,13 @@ def optimize_training_params(vram_metrics, target_vram_gb, global_batch_size):
     Returns:
         tuple: (per_device_train_batch_size, gradient_accumulation_steps)
     """
+    # 20% safety buffer for spikes and overhead
+    usable_vram_gb = target_vram_gb * 0.8
+    
     static_vram_gb = vram_metrics["total_static_gb"]
     activation_per_sample_gb = vram_metrics["activations_per_sample_gb"]
     
-    available_vram_gb = target_vram_gb - static_vram_gb
+    available_vram_gb = usable_vram_gb - static_vram_gb
     
     if available_vram_gb <= 0:
         # Static part alone exceeds budget or very close to it.
@@ -97,6 +111,7 @@ def optimize_training_params(vram_metrics, target_vram_gb, global_batch_size):
         return 1, global_batch_size
         
     # Calculate how many samples we can fit in the remaining VRAM
+    # Use a slightly more conservative division to account for non-linearities
     max_per_device_batch = int(available_vram_gb // activation_per_sample_gb)
     
     if max_per_device_batch >= global_batch_size:
