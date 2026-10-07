@@ -6,9 +6,7 @@ from transformers import AutoTokenizer
 class DatasetProcessor(AbstractDatasetProcessor):
     def __init__(self, config):
         self.config = config
-        print(f"The type is {type(self.config['model']['name'])}")
         self.tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
-        print(type(self.tokenizer))
 
     def load_dataset(self, path=None):
         dataset_path = path if path else self.config['dataset']['path']
@@ -51,11 +49,34 @@ class DatasetProcessor(AbstractDatasetProcessor):
         dataset.save_to_disk(path)
 
     def calculate_tokens_usage(self, dataset) -> list:
-        tokens_length = list()
-        for example in dataset:
-            text = example['text']
-            tokens = self.tokenizer.tokenize(text)
-            tokens_length.append(len(tokens))
+        # Batched tokenization is much faster than per-example tokenize().
+        texts = [ex["text"] for ex in dataset]
+        enc = self.tokenizer(
+            texts, add_special_tokens=True, truncation=False, padding=False
+        )
+        return [len(ids) for ids in enc["input_ids"]]
 
-        return tokens_length
+    def suggest_seq_length(
+        self, lengths, percentile: float = 95.0, margin: float = 1.1, cap: int = 4096
+    ) -> dict:
+        """Summarize token lengths and suggest a robust max_seq_length.
+
+        Uses a percentile (not max) so one outlier doesn't blow up VRAM.
+        """
+        import numpy as np
+
+        arr = np.asarray(lengths, dtype=float)
+        stats = {
+            "count": int(arr.size),
+            "max": int(arr.max()) if arr.size else 0,
+            "mean": round(float(arr.mean()), 1) if arr.size else 0,
+            f"p{percentile:g}": (
+                int(np.percentile(arr, percentile)) if arr.size else 0
+            ),
+        }
+        suggested = (
+            min(int(stats[f"p{percentile:g}"] * margin), cap) if arr.size else cap
+        )
+        stats["suggested"] = suggested
+        return stats
 
