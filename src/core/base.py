@@ -69,17 +69,21 @@ class AbstractSFTTrain(ABC):
 
 class AbstractModel(ABC):
     """
-    Handles model loading and configuration using Unsloth.
-    
+    Handles model loading and configuration (any backend: Unsloth, HF+PEFT).
+
     This class is responsible for initializing the pre-trained model and tokenizer,
     applying PEFT/LoRA configurations, and providing access to the loaded model.
     """
-    
+
+    @property
+    def backend_name(self):
+        """Backend identifier for logging/VRAM reports. Overridden by loaders."""
+        return "unknown"
+
     @abstractmethod
     def load_model(self):
         """
         Loads the pre-trained model and applies PEFT configurations.
-        Uses FastLanguageModel for efficient loading and training.
         """
         pass
 
