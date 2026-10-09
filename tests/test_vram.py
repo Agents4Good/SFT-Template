@@ -420,10 +420,13 @@ def test_probe_applies_margin_on_low_snr():
 
 
 def test_fell_back_flag_set_only_on_fallback():
-    _, _, info = optimize_training_params(
-        {"total_static_gb": 10.0, "activations_per_sample_gb": 0.5},
-        target_vram_gb=5.0, global_batch_size=64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _, _, info = optimize_training_params(
+            {"total_static_gb": 10.0, "activations_per_sample_gb": 0.5},
+            target_vram_gb=5.0, global_batch_size=64)
     assert info["fell_back"] is True
+    assert any(issubclass(w.category, UserWarning) for w in caught)
     _, _, info = optimize_training_params(
         {"total_static_gb": 1.0, "activations_per_sample_gb": 0.5},
         target_vram_gb=5.0, global_batch_size=64, allow_approximate=False)

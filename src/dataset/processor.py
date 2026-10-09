@@ -18,8 +18,14 @@ class DatasetProcessor(AbstractDatasetProcessor):
         if self._tokenizer is None:
             from transformers import AutoTokenizer
 
+            # Mirror the loader's first attempt: "auto" tries untrusted
+            # first; the loader itself retries loudly when custom code
+            # is actually needed.
+            trc = self.config['model'].get('trust_remote_code', 'auto')
+            if not isinstance(trc, bool):
+                trc = str(trc).lower() == 'true'
             self._tokenizer = AutoTokenizer.from_pretrained(
-                self.config['model']['name'])
+                self.config['model']['name'], trust_remote_code=trc)
         return self._tokenizer
 
     @tokenizer.setter
@@ -33,7 +39,7 @@ class DatasetProcessor(AbstractDatasetProcessor):
         df['id'] = range(len(df))
         df['trace'] = df['answer']
         df['raw_answer'] = df['answer']
-        return Dataset.from_pandas(df)
+        return Dataset.from_pandas(df, preserve_index=False)
 
     def format_dataset(self, dataset):
         def formatting_prompts_func(example):

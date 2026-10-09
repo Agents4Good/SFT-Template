@@ -56,7 +56,7 @@ class SFTTrain(AbstractSFTTrain):
                 try:
                     # Parse numerical or complex types using literal_eval
                     training_config[variable] = ast.literal_eval(environment_value)
-                except:
+                except (ValueError, SyntaxError):
                     training_config[variable] = environment_value
 
                 print(f"Overriding {variable} with environment variable: {training_config[variable]}")
