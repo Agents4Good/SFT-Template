@@ -4,9 +4,7 @@ SFT Template Main Entry Point
 1. Dataset processing + robust max_seq_length (p95, not max).
 2. Model load.
 3. VRAM calibration (see src/sizing.py): real static tensors +
-   forward/backward probing -> optimal batch. No heuristic formulas
-   on this path. --fast: CPU heuristic estimate (no GPU probing,
-   OOM risk accepted).
+   forward/backward probing -> optimal batch. GPU-only by design.
 4. Train + save. --dry-run prints the batch decision and exits.
 """
 
@@ -19,17 +17,38 @@ from src.sizing import calibrate, print_sizing_report
 from src.train.sft import SFTTrain
 
 
+def _lookup(config, dotted):
+    node = config
+    for part in dotted.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None, False
+        node = node[part]
+    return node, True
+
+
+_REQUIRED_KEYS = (
+    "model.name",
+    "dataset.path",
+    "dataset.train_test_split.test_size",
+    "training.global_batch_size",
+    "output.output_dir",
+)
+
+
 def load_config(path):
     with open(path, 'r') as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+    missing = [k for k in _REQUIRED_KEYS if not _lookup(config, k)[1]]
+    if missing:
+        raise KeyError(
+            f"{path} missing required keys: {', '.join(missing)}")
+    return config
 
 
 def main():
     parser = argparse.ArgumentParser(description="Run SFT Training")
     parser.add_argument("--config", type=str, default="src/config.yaml",
                         help="Path to config file")
-    parser.add_argument("--fast", action="store_true",
-                        help="Heuristic VRAM estimate, no GPU probing")
     parser.add_argument("--dry-run", action="store_true",
                         help="Probe/select batch, print, exit before training")
     args = parser.parse_args()
@@ -77,9 +96,9 @@ def main():
     print(f"Model backend: {model_handler.backend_name}")
     model = model_handler.get_model()
     tokenizer = model_handler.get_tokenizer()
+    dataset_processor.tokenizer = tokenizer
 
-    # 3. Batch selection: measure by default, heuristic with --fast.
-    # (CUDA detection lives in sizing.calibrate.)
+    # 3. Batch selection: GPU measurement.
     print("-" * 10 + "VRAM calibration" + "-" * 10)
     train_texts = list(train_dataset["text"])
     # Train-split lengths align row-for-row for worst-case probe selection.
@@ -89,7 +108,7 @@ def main():
 
     result = calibrate(
         config, model, tokenizer, train_texts, train_lengths, eval_texts,
-        budget_gb, free_before_load=free_before_load, fast=args.fast,
+        budget_gb, free_before_load=free_before_load,
     )
 
     config["training"]["per_device_train_batch_size"] = result.micro
