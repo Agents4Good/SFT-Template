@@ -1,6 +1,7 @@
 from trl import SFTTrainer, SFTConfig
 from transformers import EarlyStoppingCallback
 from src.core.base import AbstractSFTTrain
+from src.utils.push import push_model
 import datetime
 import os
 import ast
@@ -60,6 +61,18 @@ class SFTTrain(AbstractSFTTrain):
 
                 print(f"Overriding {variable} with environment variable: {training_config[variable]}")
 
+        # Re-validate batch invariant after env overrides: micro*accum should
+        # still match the effective batch chosen by the optimizer.
+        eff = (training_config.get('per_device_train_batch_size', 0)
+               * training_config.get('gradient_accumulation_steps', 0))
+        requested = self.config['training'].get('global_batch_size')
+        vram_batch = (self.config.get('_vram_report') or {}).get('batch', {})
+        expected_eff = vram_batch.get('effective_global_batch_size', requested)
+        if expected_eff and eff != expected_eff:
+            print(f"WARNING: env override changed effective batch to {eff}, "
+                  f"optimizer chose {expected_eff} (requested {requested}). "
+                  "LR schedule now sees a different batch size.")
+
         # Finalize path again to ensure accuracy at training start
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.final_path = f"{self.config['output']['output_dir']}/run-{self.timestamp}"
@@ -67,7 +80,19 @@ class SFTTrain(AbstractSFTTrain):
         # Setup directory structure and metadata backups
         os.makedirs(self.final_path, exist_ok=True)
         if self.config['output']['save_config']:
-            shutil.copy2('./src/config.yaml', os.path.join(self.final_path, 'config.yaml'))
+            import yaml as _yaml
+            # Persist the live config (includes optimized batch sizes) rather
+            # than the stale on-disk file, plus the VRAM report if present.
+            with open(os.path.join(self.final_path, 'config.yaml'), 'w') as f:
+                _yaml.safe_dump(
+                    {k: v for k, v in self.config.items() if not k.startswith('_')},
+                    f,
+                )
+            vram_report = self.config.get('_vram_report')
+            if vram_report is not None:
+                import json as _json
+                with open(os.path.join(self.final_path, 'vram_report.json'), 'w') as f:
+                    _json.dump(vram_report, f, indent=2, default=str)
         
         # Only try to copy the dataset if it refers to a local path
         if self.config['output']['save_dataset'] and os.path.exists(self.config['dataset']['path']):
@@ -78,10 +103,17 @@ class SFTTrain(AbstractSFTTrain):
         fp16_val = dtype_str == 'float16'
         bf16_val = dtype_str == 'bfloat16'
         
-        # Initialize training arguments from configuration
+        # Training arguments (pinned stack: trl 1.13, transformers 5.17).
         args = SFTConfig(
             output_dir=self.final_path,
+            dataset_text_field="text",
+            max_length=self.config['model']['max_seq_length'],
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
+            # Eval batch pinned to the trained micro batch: the VRAM probe
+            # sizes eval overhead for THIS micro (eval is forward-only, so it
+            # fits inside the measured envelope). The HF default (8) ignores
+            # the calibrated budget and OOMs large models at eval time.
+            per_device_eval_batch_size=training_config['per_device_train_batch_size'],
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
             optim=training_config['optim'],
             learning_rate=float(training_config['learning_rate']),
@@ -102,8 +134,6 @@ class SFTTrain(AbstractSFTTrain):
             push_to_hub=training_config['push_to_hub'],
             report_to=training_config['report_to'],
             gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
-            dataset_text_field="text",
-            max_seq_length=self.config['model']['max_seq_length'],
         )
 
         callbacks = []
@@ -113,23 +143,93 @@ class SFTTrain(AbstractSFTTrain):
                 early_stopping_threshold=training_config['early_stopping']['threshold']
             ))
 
-        # Build SFTTrainer
         self.trainer = SFTTrainer(
             model=self.model,
-            tokenizer=self.tokenizer,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             args=args,
-            packing=False,
             callbacks=callbacks,
+            processing_class=self.tokenizer,
         )
 
         # Execute training
         self.trainer.train()
 
+        # Post-run actuals: peak reserved/allocated + arch fingerprint go
+        # into the VRAM report (persisted to vram_report.json by save path
+        # via config), so predicted-vs-actual accrues per run for future
+        # calibration. Best-effort: never fail the run on telemetry.
+        try:
+            report = self.config.get("_vram_report")
+            if isinstance(report, dict):
+                import torch as _torch
+
+                if _torch.cuda.is_available():
+                    report["actual_peak_reserved_gb"] = round(
+                        _torch.cuda.max_memory_reserved() / 1024**3, 3
+                    )
+                    report["actual_peak_allocated_gb"] = round(
+                        _torch.cuda.max_memory_allocated() / 1024**3, 3
+                    )
+                fingerprint = {}
+                model_cfg_obj = getattr(self.model, "config", None)
+                text_cfg = (
+                    getattr(model_cfg_obj, "text_config", None)
+                    or model_cfg_obj
+                )
+                for name in (
+                    "model_type", "hidden_size", "num_hidden_layers",
+                    "num_attention_heads", "num_key_value_heads",
+                    "vocab_size", "sliding_window",
+                ):
+                    for obj in (model_cfg_obj, text_cfg):
+                        if obj is not None and hasattr(obj, name):
+                            try:
+                                fingerprint[name] = getattr(obj, name)
+                                break
+                            except Exception:
+                                continue
+                try:
+                    import transformers as _tf
+
+                    fingerprint["attn_implementation"] = getattr(
+                        model_cfg_obj, "attn_implementation", None
+                    ) if model_cfg_obj is not None else None
+                    _ = _tf  # silence unused without removing the probe
+                except Exception:
+                    pass
+                fingerprint["gradient_checkpointing"] = self.config.get(
+                    "peft", {}).get("use_gradient_checkpointing")
+                try:
+                    import cut_cross_entropy  # noqa: F401
+
+                    fingerprint["chunked_loss"] = True
+                except Exception:
+                    fingerprint["chunked_loss"] = False
+                report["arch_fingerprint"] = fingerprint
+                # vram_report.json was written pre-training; re-persist now
+                # that actuals are attached.
+                import json as _json
+
+                with open(os.path.join(self.final_path,
+                                       "vram_report.json"), "w") as f:
+                    _json.dump(report, f, indent=2, default=str)
+        except Exception as e:
+            print(f"WARNING: post-run VRAM telemetry failed ({e}); "
+                  "continuing without actuals.")
+
     def save_model(self): 
         """
         Saves the trainer's model weights to the final destination directory.
         """
-        self.trainer.save_model(self.final_path + "/Model")
+        model_dir = self.final_path + "/Model"
+        self.trainer.save_model(model_dir)
         print(f"Model saved successfully to {self.final_path}!")
+        push_cfg = (self.config.get("output") or {}).get("push") or {}
+        if push_cfg.get("enabled", False):
+            push_model(
+                model_dir,
+                push_cfg.get("repo_id"),
+                revision=push_cfg.get("revision", "main"),
+                private=push_cfg.get("private", False),
+            )

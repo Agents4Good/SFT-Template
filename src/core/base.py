@@ -36,17 +36,6 @@ class AbstractDatasetProcessor(ABC):
         """
         pass
 
-    @abstractmethod
-    def save_dataset(self, dataset, path: str):
-        """
-        Saves the processed dataset to disk.
-        
-        Args:
-            dataset: The processed dataset object.
-            path (str): Destination path for saving.
-        """
-        pass
-
 class AbstractSFTTrain(ABC):
     """
     Abstract base class for Supervised Fine-Tuning.

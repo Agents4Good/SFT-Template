@@ -48,3 +48,8 @@ output:
   output_dir: "./src/output"
   save_dataset: false
   save_config: true
+  push:
+    enabled: false
+    repo_id: ""
+    revision: "main"
+    private: false

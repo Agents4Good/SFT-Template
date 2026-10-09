@@ -1,16 +1,34 @@
 from datasets import load_dataset, Dataset
-from src.core.base import AbstractDatasetProcessor, AbstractModel
+from src.core.base import AbstractDatasetProcessor
 from src.prompts.train_prompts import user_prompt, model_prompt
-from transformers import AutoTokenizer
+
+DATASET_SUBSET = "main"
+DATASET_SPLIT = "train"
+EXCLUDE_ANSWERS = {"*"}
+EXCLUDE_IDS = {144, 190}
+
 
 class DatasetProcessor(AbstractDatasetProcessor):
-    def __init__(self, config):
+    def __init__(self, config, tokenizer=None):
         self.config = config
-        self.tokenizer = AutoTokenizer.from_pretrained(self.config['model']['name'])
+        self._tokenizer = tokenizer
+
+    @property
+    def tokenizer(self):
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.config['model']['name'])
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value):
+        self._tokenizer = value
 
     def load_dataset(self, path=None):
         dataset_path = path if path else self.config['dataset']['path']
-        dataset = load_dataset(dataset_path, "main", split="train")
+        dataset = load_dataset(dataset_path, DATASET_SUBSET, split=DATASET_SPLIT)
         df = dataset.to_pandas()
         df['id'] = range(len(df))
         df['trace'] = df['answer']
@@ -32,8 +50,10 @@ class DatasetProcessor(AbstractDatasetProcessor):
 
             return {"text": self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}
         
-        cleaned_dataset = dataset.filter(lambda example: example['answer'] != '*')
-        cleaned_dataset = cleaned_dataset.filter(lambda example: example['id'] not in {144, 190})
+        cleaned_dataset = dataset.filter(
+            lambda example: example['answer'] not in EXCLUDE_ANSWERS)
+        cleaned_dataset = cleaned_dataset.filter(
+            lambda example: example['id'] not in EXCLUDE_IDS)
         
         return cleaned_dataset.map(formatting_prompts_func)
 
@@ -44,9 +64,6 @@ class DatasetProcessor(AbstractDatasetProcessor):
             shuffle=True, 
             seed=42
         )
-
-    def save_dataset(self, dataset, path):
-        dataset.save_to_disk(path)
 
     def calculate_tokens_usage(self, dataset) -> list:
         # Batched tokenization is much faster than per-example tokenize().
