@@ -7,6 +7,33 @@ import os
 import ast
 import shutil
 
+
+class LengthGroupedSFTTrainer(SFTTrainer):
+    """SFTTrainer that batches similar-length examples together.
+
+    transformers 5.x removed the group_by_length flag but still ships
+    LengthGroupedSampler; this wires it through the _get_train_sampler
+    extension point. Example boundaries and loss are unchanged, only
+    which examples share a batch differs, so padding waste shrinks.
+    """
+
+    def __init__(self, *args, group_by_length=False, **kwargs):
+        self._group_by_length = group_by_length
+        super().__init__(*args, **kwargs)
+
+    def _get_train_sampler(self, train_dataset=None):
+        if not self._group_by_length:
+            return super()._get_train_sampler(train_dataset)
+        from transformers.trainer_pt_utils import LengthGroupedSampler
+
+        return LengthGroupedSampler(
+            self.args.train_batch_size
+            * self.args.gradient_accumulation_steps,
+            dataset=train_dataset
+            if train_dataset is not None else self.train_dataset,
+            model_input_name="input_ids",
+        )
+
 class SFTTrain(AbstractSFTTrain):
     """
     Handles the Supervised Fine-Tuning (SFT) training cycle.
@@ -115,6 +142,7 @@ class SFTTrain(AbstractSFTTrain):
             # the calibrated budget and OOMs large models at eval time.
             per_device_eval_batch_size=training_config['per_device_train_batch_size'],
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
+            save_total_limit=training_config.get('save_total_limit', 2),
             optim=training_config['optim'],
             learning_rate=float(training_config['learning_rate']),
             weight_decay=0.01,
@@ -143,13 +171,14 @@ class SFTTrain(AbstractSFTTrain):
                 early_stopping_threshold=training_config['early_stopping']['threshold']
             ))
 
-        self.trainer = SFTTrainer(
+        self.trainer = LengthGroupedSFTTrainer(
             model=self.model,
             train_dataset=self.train_dataset,
             eval_dataset=self.eval_dataset,
             args=args,
             callbacks=callbacks,
             processing_class=self.tokenizer,
+            group_by_length=training_config.get('group_by_length', False),
         )
 
         # Execute training

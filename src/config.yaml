@@ -29,7 +29,9 @@ training:
   num_train_epochs: 5
   max_steps: -1
   eval_save_strategy: "steps"
-  eval_save_steps: 10
+  eval_save_steps: 200
+  save_total_limit: 2
+  group_by_length: true
   load_best_model_at_end: true
   metric_for_best_model: "eval_loss"
   push_to_hub: false

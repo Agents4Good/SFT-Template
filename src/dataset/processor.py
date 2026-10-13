@@ -73,8 +73,12 @@ class DatasetProcessor(AbstractDatasetProcessor):
 
     def calculate_tokens_usage(self, dataset) -> list:
         # Batched tokenization is much faster than per-example tokenize().
+        # Use the text tokenizer: the handler tokenizer may be a multimodal
+        # processor (e.g. Gemma4) whose __call__ routes plain text through
+        # image fetching and fails on vision-less input.
+        tok = getattr(self.tokenizer, "tokenizer", self.tokenizer)
         texts = [ex["text"] for ex in dataset]
-        enc = self.tokenizer(
+        enc = tok(
             texts, add_special_tokens=True, truncation=False, padding=False
         )
         return [len(ids) for ids in enc["input_ids"]]
