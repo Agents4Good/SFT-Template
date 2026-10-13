@@ -171,14 +171,16 @@ def test_sizing_static_adds_second_opt_instance():
 
 def test_training_baseline_derives_floor_from_probe():
     # floor = smallest-micro peak minus its activation share, + trainer
-    # optimizer instance, x fragmentation growth.
+    # optimizer instance. Growth factor is 1.0: the old 1.1 was fit
+    # against eval-inclusive peaks (double-counted eval); micro-1
+    # no-eval actuals (9.123) match the uninflated floor + slope growth.
     static = {"weights_gb": 7.0, "gradients_gb": 0.2, "optimizer_gb": 0.1,
-              "total_static_gb": 7.3, "method": "measured"}
+                "total_static_gb": 7.3, "method": "measured"}
     probe = {"reserved_peaks": {1: 9 * GB, 2: 9 * GB + GB // 10,
                                 4: 9 * GB + 3 * GB // 10},
              "per_sample_reserved_gb": 0.1}
     got = training_baseline_gb(static, probe)
-    assert got == round((9.0 - 0.1 + 0.1) * 1.1, 3)
+    assert got == round((9.0 - 0.1 + 0.1) * 1.0, 3)
 
 
 def test_training_baseline_falls_back_without_peaks():
@@ -190,7 +192,10 @@ def test_training_baseline_falls_back_without_peaks():
 
 
 def test_predicted_peak_adds_slopes_linearly():
-    assert predicted_peak_gb(9.9, 0.1, 2, 0.3) == round(9.9 + 0.2 + 0.6, 3)
+    # Eval charged at its own micro (decoupled from train): train 4 with
+    # eval pinned to 1.
+    assert predicted_peak_gb(9.9, 0.1, 4, 0.3, 1) == round(
+        9.9 + 0.4 + 0.3, 3)
 
 
 def test_slope_takes_max_consecutive():
@@ -469,8 +474,11 @@ def test_probe_clamps_noisy_eval_to_train_slope():
     per = int(0.1 * GB)
 
     def _run(ckpt):
+        # train micros (1,2) + eval micros (1,2,4), one repeat each.
+        # eval slopes: 8per, 4per -> max wins (8per).
         cuda = _StubCuda(base, [base + per, base + 2 * per,
-                                base + per, base + 9 * per])
+                                base + per, base + 9 * per,
+                                base + 17 * per])
         model = _StubModel([_FakeParam(10, 4)])
         return probe_per_sample_bytes(
             model, None, _StubOpt(), ["a", "b"], 128,
@@ -494,3 +502,43 @@ def test_probe_clamps_noisy_eval_to_train_slope():
     # Unknown: safe side, no clamp.
     out = _run(None)
     assert out["clamped_eval"] is False
+
+
+def test_max_micro_cap_bounds_result():
+    # Same inputs as test_strict_divisor (uncapped -> 4x16); cap 2 forces
+    # the strict search at/below 2 -> 2x32. Default (no cap) unchanged.
+    micro, accum, _ = optimize_training_params(
+        _metrics(1.0, 0.5),
+        target_vram_gb=5.0,
+        global_batch_size=64,
+        safety=0.9,
+        reserve_gb=0.8,
+        eval_overhead_gb=0.3,
+        allow_approximate=False,
+        max_micro_cap=2,
+    )
+    assert (micro, accum) == (2, 32)
+
+
+def test_decoupled_eval_charge_selects_probed_max():
+    from src.sizing import EVAL_MICRO_BATCH
+
+    # Recorded run (budget 11, floor 8.863, train slope 0.0117, clean eval
+    # slope 0.4512): eval charged at the pinned micro 1, train capped at
+    # the largest probed micro 4 -> (4, 16), no fallback. Train was
+    # retry-free at every micro 1-4 on GPU; eval transients (the old
+    # coupled charge) are avoided by the pin, not by shrinking train.
+    assert EVAL_MICRO_BATCH == 1
+    micro, accum, info = optimize_training_params(
+        _metrics(8.863, 0.0117),
+        target_vram_gb=11.0,
+        global_batch_size=64,
+        safety=0.95,
+        reserve_gb=0.0,
+        eval_overhead_gb=0.4512 * EVAL_MICRO_BATCH,
+        allow_approximate=True,
+        max_micro_cap=4,
+    )
+    assert (micro, accum) == (4, 16)
+    assert info["fell_back"] is False
+    assert info["eval_overhead_gb"] == round(0.4512, 3)

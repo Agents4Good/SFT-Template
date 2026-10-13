@@ -32,6 +32,15 @@ def _longest_texts(texts, lengths, k):
     return [texts[i] for i in order[:max(1, min(k, len(texts)))]]
 
 
+# Eval runs at micro 1 regardless of the train micro. Real runs showed
+# every allocator OOM-retry comes from early-eval transient grabs
+# (~1-1.5 GB first-batch blocks over micros 2-4), which the clean probe
+# eval slope (~0.45 GB/sample) cannot see; train itself was retry-free
+# at every micro 1-4. Eval time at micro 1 (~+3 min per eval here) is
+# negligible next to train, and train speed is unaffected.
+EVAL_MICRO_BATCH = 1
+
+
 def calibrate_measured(config, model, tokenizer, train_texts, train_lengths,
                        eval_texts, budget_gb):
     """Full measurement path: real static tensors + forward/backward probing.
@@ -60,7 +69,7 @@ def calibrate_measured(config, model, tokenizer, train_texts, train_lengths,
     )
     probe_texts = _longest_texts(train_texts, train_lengths, max(micros))
     eval_probe_texts = (
-        _longest_texts(eval_texts, [len(t) for t in eval_texts], 2)
+        _longest_texts(eval_texts, [len(t) for t in eval_texts], 4)
         if probe_cfg.get("measure_eval", True) and eval_texts
         else None
     )
@@ -102,20 +111,19 @@ def calibrate_measured(config, model, tokenizer, train_texts, train_lengths,
         max_deviation=train_cfg.get("max_batch_deviation", 0.05),
         max_accum_steps=train_cfg.get("max_accum_steps", 64),
     )
-    # Pass 1 ignores eval to get a candidate micro; pass 2 charges
-    # measured eval slope scaled by that micro (monotonic: micro can only
-    # stay or shrink, so the charge is conservative).
-    micro1, _, _ = optimize_training_params(
-        metrics, target_vram_gb=budget_gb, eval_overhead_gb=0.0, **common
-    )
-    eval_overhead = probe["eval_per_sample_reserved_gb"] * micro1
+    # Single pass: eval is charged at the pinned micro-1 slope (not the
+    # train micro), and train never selects above the largest probed
+    # micro -- the train slope at these sizes is allocator noise
+    # (flat 2->4), and extrapolating it to 8/16/64 is the 67 GB phantom
+    # in reverse. Probe micros [1,2,4] therefore cap train at 4.
+    eval_overhead = probe["eval_per_sample_reserved_gb"] * EVAL_MICRO_BATCH
     micro, accum, batch_info = optimize_training_params(
         metrics, target_vram_gb=budget_gb,
-        eval_overhead_gb=eval_overhead, **common
+        eval_overhead_gb=eval_overhead, max_micro_cap=max(micros), **common
     )
     predicted_peak_gb_val = predicted_peak_gb(
         sizing_static, probe["per_sample_reserved_gb"], micro,
-        probe["eval_per_sample_reserved_gb"],
+        probe["eval_per_sample_reserved_gb"], EVAL_MICRO_BATCH,
     )
     probe_warnings = []
     if probe["oom_at"] is not None:
@@ -147,6 +155,8 @@ def calibrate_measured(config, model, tokenizer, train_texts, train_lengths,
         "predicted_peak_reserved_gb": predicted_peak_gb_val,
         "peaks_bytes": probe["peaks"],
         "reserved_peaks_bytes": probe["reserved_peaks"],
+        "eval_peaks_bytes": probe["eval_peaks"],
+        "eval_reserved_peaks_bytes": probe["eval_reserved_peaks"],
         "oom_at": probe["oom_at"],
         "batch": batch_info,
         "total_params": total_params,
@@ -204,6 +214,11 @@ def print_sizing_report(result, free_before_load=None,
     print(f"Per-sample reserved (measured): "
           f"{report['per_sample_reserved_gb']:.4f} GB, "
           f"reserved peaks {report['reserved_peaks_bytes']}")
+    print(f"Eval per-sample reserved (measured): "
+          f"{report['eval_per_sample_reserved_gb']:.4f} GB, "
+          f"reserved peaks {report['eval_reserved_peaks_bytes']}")
+    print(f"Eval overhead charged: {report['eval_overhead_gb']} GB "
+          f"(eval batch pinned to {EVAL_MICRO_BATCH})")
     print(f"Predicted peak (reserved): "
           f"{report['predicted_peak_reserved_gb']} GB")
     print(f"Budget: {report.get('budget_gb')} GB "

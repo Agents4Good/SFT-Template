@@ -136,11 +136,13 @@ class SFTTrain(AbstractSFTTrain):
             dataset_text_field="text",
             max_length=self.config['model']['max_seq_length'],
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
-            # Eval batch pinned to the trained micro batch: the VRAM probe
-            # sizes eval overhead for THIS micro (eval is forward-only, so it
-            # fits inside the measured envelope). The HF default (8) ignores
-            # the calibrated budget and OOMs large models at eval time.
-            per_device_eval_batch_size=training_config['per_device_train_batch_size'],
+            # Eval batch pinned to 1, decoupled from the train micro: real
+            # runs showed every allocator OOM-retry comes from early-eval
+            # transient grabs (~1-1.5 GB blocks at eval micros 2-4), which
+            # the clean probe eval slope cannot see; train itself was
+            # retry-free at every micro 1-4. The HF default (8) ignores the
+            # calibrated budget and OOMs large models at eval time.
+            per_device_eval_batch_size=1,
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
             save_total_limit=training_config.get('save_total_limit', 2),
             optim=training_config['optim'],

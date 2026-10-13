@@ -4,7 +4,7 @@ model:
   trust_remote_code: auto # auto | true | false (hf backend only)
   dtype: "bfloat16"
   load_in_4bit: true
-  target_total_vram_gb: 5.0
+  target_total_vram_gb: 11
 
 probe:
   micros: [1, 2, 4]

@@ -5,13 +5,14 @@ from contextlib import nullcontext
 
 import torch
 
-# Fragmentation growth from probe floor to steady training: reserved
-# ratchets up ~10% under sustained alloc/free cycles (caching allocator
-# grabs new segments instead of reusing). Measured 10.6% (8.78 -> 9.71 GB)
-# on Gemma-4/RTX3060; rounded to 1.1, safe side. Applies to the resident
-# floor only -- transient activation/eval peaks reuse blocks. Validated
-# per-run via actual_peak_* in vram_report.json; adjust if they disagree.
-_FRAGMENTATION_FACTOR = 1.1
+# Resident floor growth from probe to steady training: reserved runs
+# slightly above the probe floor under sustained alloc/free cycles. Was
+# 1.1 (Oct run: 8.78 -> 9.71 GB) until per-run actuals showed that rise
+# INCLUDED eval peaks -- with eval now charged explicitly at its own
+# slope, the floor stays train-only (micro-1 no-eval actuals: 9.123 vs
+# uninflated 8.866; the rest is covered by slope x micro + safety).
+# Validated per-run via actual_peak_* in vram_report.json.
+_FRAGMENTATION_FACTOR = 1.0
 _BYTES_PER_DTYPE = {
     "float32": 4,
     "float16": 2,
@@ -155,9 +156,11 @@ def training_baseline_gb(static_tensors, probe):
     captures weights, context, grads, the probe optimizer state AND the
     fragmentation the probe itself produced -- everything a post-load
     snapshot misses (~1 GB on Gemma-4). The trainer's own optimizer
-    instance is added on top, then the fragmentation growth factor (steady
-    training ratchets reserved ~10% above the probe floor). Falls back to
-    sizing_static_gb() when the probe produced no peaks (warmup OOM).
+    instance is added on top. The growth factor stays 1.0: steady-state
+    growth is covered by slope x micro plus the explicit eval charge
+    (the old 1.1 was fit against eval-inclusive peaks, double-counting
+    eval). Falls back to sizing_static_gb() when the probe produced no
+    peaks (warmup OOM).
     """
     peaks = probe.get("reserved_peaks") or {}
     slope = probe.get("per_sample_reserved_gb", 0.0) or 0.0
@@ -169,15 +172,17 @@ def training_baseline_gb(static_tensors, probe):
     return sizing_static_gb(static_tensors)
 
 
-def predicted_peak_gb(baseline_gb, slope_gb, micro, eval_slope_gb):
+def predicted_peak_gb(baseline_gb, slope_gb, micro, eval_slope_gb,
+                      eval_micro):
     """Predicted steady-state reserved peak in GB. Pure.
 
     Baseline already includes fragmentation growth; transient activation
     and eval peaks reuse blocks and are added linearly. Eval is charged at
-    its own (forward-only, un-checkpointed) slope, not the train slope.
+    its own (forward-only, un-checkpointed) slope times the eval micro,
+    which the caller pins below the train micro (eval transients).
     """
     return round(
-        baseline_gb + slope_gb * micro + eval_slope_gb * micro,
+        baseline_gb + slope_gb * micro + eval_slope_gb * eval_micro,
         3,
     )
 
@@ -364,40 +369,53 @@ def probe_per_sample_bytes(
     )
     eval_per_sample_gb = 0.0
     eval_per_sample_reserved_gb = 0.0
+    eval_peaks = {}
+    eval_reserved_peaks = {}
     if eval_texts:
         model.eval()
-        eval_peaks = {}
-        eval_reserved_peaks = {}
-        for micro in (1, 2):
+        # Multi-point, repeated sampling like the train probe: a 2-point
+        # single-shot eval slope once read a lone allocator block step as
+        # 0.76 GB/sample against a true ~0.37 (measured 2026-10).
+        for micro in (1, 2, 4):
             try:
-                cuda.reset_peak_memory_stats()
-                enc = (
-                    _batch_fn(micro)
-                    if _batch_fn is not None
-                    else _tokenize(eval_texts[:micro])
-                )
-                if not isinstance(enc, dict):
-                    ids = enc["input_ids"].to(device)
-                    m = enc.get("attention_mask")
-                    enc = {
-                        "input_ids": ids,
-                        "attention_mask": m.to(device) if m is not None else None,
-                    }
-                else:
-                    enc = {
-                        k: (v.to(device) if hasattr(v, "to") else v)
-                        for k, v in enc.items()
-                    }
-                with torch.no_grad(), _actx():
-                    model(
-                        **{k: v for k, v in enc.items() if v is not None}
+                eval_best = None
+                eval_best_reserved = None
+                for _ in range(max(1, repeats)):
+                    cuda.reset_peak_memory_stats()
+                    enc = (
+                        _batch_fn(micro)
+                        if _batch_fn is not None
+                        else _tokenize(eval_texts[:micro])
                     )
-                cuda.synchronize()
-                eval_peaks[micro] = cuda.max_memory_allocated()
-                try:
-                    eval_reserved_peaks[micro] = cuda.max_memory_reserved()
-                except Exception:
-                    eval_reserved_peaks[micro] = eval_peaks[micro]
+                    if not isinstance(enc, dict):
+                        ids = enc["input_ids"].to(device)
+                        m = enc.get("attention_mask")
+                        enc = {
+                            "input_ids": ids,
+                            "attention_mask": m.to(device) if m is not None else None,
+                        }
+                    else:
+                        enc = {
+                            k: (v.to(device) if hasattr(v, "to") else v)
+                            for k, v in enc.items()
+                        }
+                    with torch.no_grad(), _actx():
+                        model(
+                            **{k: v for k, v in enc.items() if v is not None}
+                        )
+                    cuda.synchronize()
+                    a = cuda.max_memory_allocated()
+                    try:
+                        r = cuda.max_memory_reserved()
+                    except Exception:
+                        r = a
+                    eval_best = a if eval_best is None else max(eval_best, a)
+                    eval_best_reserved = (
+                        r if eval_best_reserved is None
+                        else max(eval_best_reserved, r)
+                    )
+                eval_peaks[micro] = eval_best
+                eval_reserved_peaks[micro] = eval_best_reserved
             except RuntimeError as e:
                 if _is_oom(e):
                     break
@@ -422,9 +440,14 @@ def probe_per_sample_bytes(
         per_sample_gb *= 2.0
     if low_snr and per_sample_reserved_gb > 0:
         per_sample_reserved_gb *= 2.0
-    if low_snr and eval_per_sample_gb > 0:
+    # Eval gets its own SNR verdict: its peaks are usually clean and
+    # linear even when train peaks are noise-flat (checkpointing shrinks
+    # the train footprint but not eval's). Margining a clean 0.45 slope
+    # to 0.90 halved the feasible micro on a real run (2026-10).
+    eval_low_snr = probe_low_snr(eval_reserved_peaks, reserved_baseline)
+    if eval_low_snr and eval_per_sample_gb > 0:
         eval_per_sample_gb *= 2.0
-    if low_snr and eval_per_sample_reserved_gb > 0:
+    if eval_low_snr and eval_per_sample_reserved_gb > 0:
         eval_per_sample_reserved_gb *= 2.0
 
     # Physical invariant (checkpointing OFF only): eval is forward-only, so
@@ -447,6 +470,8 @@ def probe_per_sample_bytes(
     return {
         "peaks": peaks,
         "reserved_peaks": reserved_peaks,
+        "eval_peaks": eval_peaks,
+        "eval_reserved_peaks": eval_reserved_peaks,
         "baseline_bytes": baseline,
         "reserved_baseline_bytes": reserved_baseline,
         "per_sample_gb": per_sample_gb,
@@ -470,6 +495,7 @@ def optimize_training_params(
     allow_approximate=True,
     max_deviation=0.05,
     max_accum_steps=64,
+    max_micro_cap=None,
 ):
     """Pick micro-batch size and gradient accumulation steps.
 
@@ -480,6 +506,8 @@ def optimize_training_params(
     large model would falsely fall back to (1, N). Callers: resolve the
     budget BEFORE loading via min(config_target, free_before_load).
     target_vram_gb=None uses current free as the total (only valid pre-load).
+    max_micro_cap bounds the result (sizing caps at the eval-feasible
+    micro so the eval charge stays self-consistent; None = uncapped).
 
     Returns:
         (per_device_train_batch_size, gradient_accumulation_steps, info_dict).
@@ -528,6 +556,7 @@ def optimize_training_params(
             "static_gb": static_gb,
             "free_gb": free_gb,
             "target_gb": effective_target,
+            "eval_overhead_gb": round(eval_overhead_gb, 3),
             "warnings": warnings_list + list(extra_warnings),
         }
 
@@ -551,6 +580,10 @@ def optimize_training_params(
                                           fell_back=True)
 
     max_micro = int(available_gb // per_sample_gb)
+    if max_micro_cap is not None:
+        # Before the early return: uncapped max_micro >= global silently
+        # bypassed the cap (real run: predicted 67 GB yet chose micro 64).
+        max_micro = min(max_micro, max(1, max_micro_cap))
     if max_micro >= global_batch_size:
         return (
             global_batch_size,
