@@ -218,6 +218,14 @@ def test_unknown_decoder_type_warns_and_proceeds(monkeypatch):
     assert h.backend_name == "hf-peft"
 
 
+def test_qwen3_5_type_loads_without_warning(monkeypatch):
+    _stub_transformers(monkeypatch, model_type="qwen3_5")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        h = create_model_handler(_base_config(model={"backend": "hf"}))
+    assert h.backend_name == "hf-peft"
+
+
 def test_pad_token_falls_back_to_eos(monkeypatch):
     state, _ = _stub_transformers(monkeypatch, pad_token=None)
     h = create_model_handler(_base_config(model={"backend": "hf"}))

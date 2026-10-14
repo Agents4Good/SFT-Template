@@ -1,16 +1,9 @@
 model:
-  name: "unsloth/gemma-4-E2B-it"
+  name: "unsloth/Qwen3.5-2B"
   backend: auto # auto | unsloth | hf
   trust_remote_code: auto # auto | true | false (hf backend only)
   dtype: "bfloat16"
   load_in_4bit: true
-  target_total_vram_gb: 11
-
-probe:
-  micros: [1, 2, 4]
-  repeats: 2
-  safety: 0.95
-  measure_eval: true
 
 dataset:
   path: "openai/gsm8k"
@@ -18,10 +11,11 @@ dataset:
     test_size: 0.1
 
 training:
-  global_batch_size: 64
-  allow_approximate_batch: true
-  max_batch_deviation: 0.05
-  max_accum_steps: 64
+  # Fixed batch sizes, set by hand per model/GPU. A pre-flight fit check
+  # runs one train step + one eval forward at the real longest sequences
+  # and fails fast on OOM; there is no auto-sizing (see fit_check.py).
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 16
   optim: "adamw_8bit"
   learning_rate: 3.0e-4
   lr_scheduler_type: "cosine"

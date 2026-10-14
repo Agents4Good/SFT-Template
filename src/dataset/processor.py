@@ -7,6 +7,24 @@ DATASET_SPLIT = "train"
 EXCLUDE_ANSWERS = {"*"}
 EXCLUDE_IDS = {144, 190}
 
+# Assistant-turn role for chat templates, by model family. Gemma templates
+# use "model"; Qwen/Llama/Mistral-style templates expect "assistant" and
+# misrender or reject "model". Matched case-insensitively against the
+# configured model name; anything unlisted gets the common default.
+_ASSISTANT_ROLE_BY_FAMILY = (
+    ("gemma", "model"),
+)
+_DEFAULT_ASSISTANT_ROLE = "assistant"
+
+
+def assistant_role_for_model(model_name):
+    """Assistant-turn role for the model's chat template. Pure."""
+    name = (model_name or "").lower()
+    for family, role in _ASSISTANT_ROLE_BY_FAMILY:
+        if family in name:
+            return role
+    return _DEFAULT_ASSISTANT_ROLE
+
 
 class DatasetProcessor(AbstractDatasetProcessor):
     def __init__(self, config, tokenizer=None):
@@ -51,7 +69,9 @@ class DatasetProcessor(AbstractDatasetProcessor):
 
             messages = [
                 {"role": "user", "content": prompt_text},
-                {"role": "model", "content": model_response_str},
+                {"role": assistant_role_for_model(
+                    (self.config.get("model") or {}).get("name", "")),
+                 "content": model_response_str},
             ]
 
             return {"text": self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)}

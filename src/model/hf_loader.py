@@ -7,6 +7,7 @@ from src.core.base import AbstractModel
 # Model types known to be decoder-only causal LMs trainable on this SFT path.
 _CAUSAL_MODEL_TYPES = frozenset({
     "llama", "mistral", "mixtral", "qwen2", "qwen2_moe", "qwen3", "qwen3_moe",
+    "qwen3_5", "qwen3_5_moe",
     "gemma", "gemma2", "gemma3", "phi", "phi3", "falcon", "gpt2", "gpt_neox",
     "opt", "bloom", "deepseek_v2", "deepseek_v3", "command-r",
 })
@@ -136,7 +137,7 @@ class HFModel(AbstractModel):
         model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
         if not load_in_4bit and torch.cuda.is_available():
             # Single-GPU template scope: keep every param on cuda:0 so the
-            # VRAM probe (one device) and training see the same placement.
+            # fit check (one device) and training see the same placement.
             # Quantized loads are already placed via device_map="auto".
             model.to("cuda")
 

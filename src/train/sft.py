@@ -88,17 +88,16 @@ class SFTTrain(AbstractSFTTrain):
 
                 print(f"Overriding {variable} with environment variable: {training_config[variable]}")
 
-        # Re-validate batch invariant after env overrides: micro*accum should
-        # still match the effective batch chosen by the optimizer.
-        eff = (training_config.get('per_device_train_batch_size', 0)
-               * training_config.get('gradient_accumulation_steps', 0))
-        requested = self.config['training'].get('global_batch_size')
-        vram_batch = (self.config.get('_vram_report') or {}).get('batch', {})
-        expected_eff = vram_batch.get('effective_global_batch_size', requested)
-        if expected_eff and eff != expected_eff:
-            print(f"WARNING: env override changed effective batch to {eff}, "
-                  f"optimizer chose {expected_eff} (requested {requested}). "
-                  "LR schedule now sees a different batch size.")
+        # Batch sizes are fixed in config (no auto-sizing): they must be
+        # present and positive after env overrides.
+        micro = training_config.get('per_device_train_batch_size', 0)
+        accum = training_config.get('gradient_accumulation_steps', 0)
+        if (not isinstance(micro, int) or not isinstance(accum, int)
+                or micro <= 0 or accum <= 0):
+            raise ValueError(
+                "training.per_device_train_batch_size and "
+                "training.gradient_accumulation_steps must be positive "
+                f"ints, got {micro!r} and {accum!r}.")
 
         # Finalize path again to ensure accuracy at training start
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -108,18 +107,13 @@ class SFTTrain(AbstractSFTTrain):
         os.makedirs(self.final_path, exist_ok=True)
         if self.config['output']['save_config']:
             import yaml as _yaml
-            # Persist the live config (includes optimized batch sizes) rather
-            # than the stale on-disk file, plus the VRAM report if present.
+            # Persist the live config (includes env overrides) rather
+            # than the stale on-disk file.
             with open(os.path.join(self.final_path, 'config.yaml'), 'w') as f:
                 _yaml.safe_dump(
                     {k: v for k, v in self.config.items() if not k.startswith('_')},
                     f,
                 )
-            vram_report = self.config.get('_vram_report')
-            if vram_report is not None:
-                import json as _json
-                with open(os.path.join(self.final_path, 'vram_report.json'), 'w') as f:
-                    _json.dump(vram_report, f, indent=2, default=str)
         
         # Only try to copy the dataset if it refers to a local path
         if self.config['output']['save_dataset'] and os.path.exists(self.config['dataset']['path']):
@@ -138,10 +132,9 @@ class SFTTrain(AbstractSFTTrain):
             per_device_train_batch_size=training_config['per_device_train_batch_size'],
             # Eval batch pinned to 1, decoupled from the train micro: real
             # runs showed every allocator OOM-retry comes from early-eval
-            # transient grabs (~1-1.5 GB blocks at eval micros 2-4), which
-            # the clean probe eval slope cannot see; train itself was
-            # retry-free at every micro 1-4. The HF default (8) ignores the
-            # calibrated budget and OOMs large models at eval time.
+            # transient grabs at larger eval micros; train itself was
+            # retry-free at every micro 1-4. The HF default (8) OOMs
+            # large models at eval time.
             per_device_eval_batch_size=1,
             gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
             save_total_limit=training_config.get('save_total_limit', 2),
@@ -187,64 +180,62 @@ class SFTTrain(AbstractSFTTrain):
         self.trainer.train()
 
         # Post-run actuals: peak reserved/allocated + arch fingerprint go
-        # into the VRAM report (persisted to vram_report.json by save path
-        # via config), so predicted-vs-actual accrues per run for future
-        # calibration. Best-effort: never fail the run on telemetry.
+        # to peak_memory.json. Observability only -- nothing here feeds
+        # any decision (there is no sizing anymore). Best-effort: never
+        # fail the run on telemetry.
         try:
-            report = self.config.get("_vram_report")
-            if isinstance(report, dict):
-                import torch as _torch
+            import torch as _torch
 
-                if _torch.cuda.is_available():
-                    report["actual_peak_reserved_gb"] = round(
-                        _torch.cuda.max_memory_reserved() / 1024**3, 3
-                    )
-                    report["actual_peak_allocated_gb"] = round(
-                        _torch.cuda.max_memory_allocated() / 1024**3, 3
-                    )
-                fingerprint = {}
-                model_cfg_obj = getattr(self.model, "config", None)
-                text_cfg = (
-                    getattr(model_cfg_obj, "text_config", None)
-                    or model_cfg_obj
+            actuals = {
+                "backend": getattr(self.model, "__class__", type).__name__,
+                "per_device_train_batch_size": training_config[
+                    "per_device_train_batch_size"],
+                "gradient_accumulation_steps": training_config[
+                    "gradient_accumulation_steps"],
+            }
+            if _torch.cuda.is_available():
+                actuals["actual_peak_reserved_gb"] = round(
+                    _torch.cuda.max_memory_reserved() / 1024**3, 3
                 )
-                for name in (
-                    "model_type", "hidden_size", "num_hidden_layers",
-                    "num_attention_heads", "num_key_value_heads",
-                    "vocab_size", "sliding_window",
-                ):
-                    for obj in (model_cfg_obj, text_cfg):
-                        if obj is not None and hasattr(obj, name):
-                            try:
-                                fingerprint[name] = getattr(obj, name)
-                                break
-                            except Exception:
-                                continue
-                try:
-                    import transformers as _tf
+                actuals["actual_peak_allocated_gb"] = round(
+                    _torch.cuda.max_memory_allocated() / 1024**3, 3
+                )
+            fingerprint = {}
+            model_cfg_obj = getattr(self.model, "config", None)
+            text_cfg = (
+                getattr(model_cfg_obj, "text_config", None)
+                or model_cfg_obj
+            )
+            for name in (
+                "model_type", "hidden_size", "num_hidden_layers",
+                "num_attention_heads", "num_key_value_heads",
+                "vocab_size", "sliding_window",
+            ):
+                for obj in (model_cfg_obj, text_cfg):
+                    if obj is not None and hasattr(obj, name):
+                        try:
+                            fingerprint[name] = getattr(obj, name)
+                            break
+                        except Exception:
+                            continue
+            fingerprint["attn_implementation"] = (
+                getattr(model_cfg_obj, "attn_implementation", None)
+                if model_cfg_obj is not None else None
+            )
+            fingerprint["gradient_checkpointing"] = self.config.get(
+                "peft", {}).get("use_gradient_checkpointing")
+            try:
+                import cut_cross_entropy  # noqa: F401
 
-                    fingerprint["attn_implementation"] = getattr(
-                        model_cfg_obj, "attn_implementation", None
-                    ) if model_cfg_obj is not None else None
-                    _ = _tf  # silence unused without removing the probe
-                except Exception:
-                    pass
-                fingerprint["gradient_checkpointing"] = self.config.get(
-                    "peft", {}).get("use_gradient_checkpointing")
-                try:
-                    import cut_cross_entropy  # noqa: F401
+                fingerprint["chunked_loss"] = True
+            except Exception:
+                fingerprint["chunked_loss"] = False
+            actuals["arch_fingerprint"] = fingerprint
+            import json as _json
 
-                    fingerprint["chunked_loss"] = True
-                except Exception:
-                    fingerprint["chunked_loss"] = False
-                report["arch_fingerprint"] = fingerprint
-                # vram_report.json was written pre-training; re-persist now
-                # that actuals are attached.
-                import json as _json
-
-                with open(os.path.join(self.final_path,
-                                       "vram_report.json"), "w") as f:
-                    _json.dump(report, f, indent=2, default=str)
+            with open(os.path.join(self.final_path,
+                                   "peak_memory.json"), "w") as f:
+                _json.dump(actuals, f, indent=2, default=str)
         except Exception as e:
             print(f"WARNING: post-run VRAM telemetry failed ({e}); "
                   "continuing without actuals.")

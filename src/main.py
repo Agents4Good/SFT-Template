@@ -1,11 +1,10 @@
 """
 SFT Template Main Entry Point
 -----------------------------
-1. Dataset processing + robust max_seq_length (p95, not max).
+1. Dataset processing + exact max_seq_length (real longest sample).
 2. Model load.
-3. VRAM calibration (see src/sizing.py): real static tensors +
-   forward/backward probing -> optimal batch. GPU-only by design.
-4. Train + save. --dry-run prints the batch decision and exits.
+3. Pre-flight fit check at real data lengths (see src/train/fit_check.py).
+4. Train + save. --dry-run runs the fit check and exits.
 """
 
 import argparse
@@ -13,7 +12,6 @@ import argparse
 import yaml
 
 from src.dataset.processor import DatasetProcessor
-from src.sizing import calibrate, print_sizing_report
 from src.train.sft import SFTTrain
 
 
@@ -30,7 +28,8 @@ _REQUIRED_KEYS = (
     "model.name",
     "dataset.path",
     "dataset.train_test_split.test_size",
-    "training.global_batch_size",
+    "training.per_device_train_batch_size",
+    "training.gradient_accumulation_steps",
     "output.output_dir",
 )
 
@@ -50,23 +49,10 @@ def main():
     parser.add_argument("--config", type=str, default="src/config.yaml",
                         help="Path to config file")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Probe/select batch, print, exit before training")
+                        help="Fit check at real lengths, print, exit")
     args = parser.parse_args()
 
     config = load_config(args.config)
-
-    # Budget resolved FIRST, before anything allocates GPU memory.
-    # Post-load "free" already excludes resident weights (double-counts
-    # static), so the total budget must come from pre-load state.
-    from src.utils.vram import get_free_vram_gb, resolve_budget
-
-    free_before_load = get_free_vram_gb()
-    budget_gb, budget_notes = resolve_budget(
-        config["model"].get("target_total_vram_gb"), free_before_load
-    )
-    print(f"VRAM budget: {budget_gb} GB (free before load: {free_before_load})")
-    for note in budget_notes:
-        print(f"NOTE: {note}")
 
     # 1. Dataset Processing
     print("-" * 10 + "Processing Dataset" + "-" * 10)
@@ -77,14 +63,18 @@ def main():
     train_dataset = split_dataset["train"]
     eval_dataset = split_dataset["test"]
 
+    # Exact sequence length: tokenize the final texts and take the real
+    # max. No percentile, no truncation surprises -- the fit check below
+    # tests this exact length, which (under length-grouped batching) is
+    # also the true worst case. An explicit config value is respected.
     if config["model"].get("max_seq_length") is None:
-        print("Calculating sequence length stats from dataset...")
-        lengths = dataset_processor.calculate_tokens_usage(formatted_dataset)
-        stats = dataset_processor.suggest_seq_length(lengths)
-        config["model"]["max_seq_length"] = stats["suggested"]
-        print(f"Token stats: {stats}")
+        print("Measuring exact sequence lengths from dataset...")
+        lengths = dataset_processor.calculate_tokens_usage(
+            formatted_dataset)
+        config["model"]["max_seq_length"] = max(lengths) if lengths else 0
+        print(f"Token count: {len(lengths)}, "
+              f"max length: {config['model']['max_seq_length']}")
     else:
-        lengths = None
         print(f"Using max sequence length from config: "
               f"{config['model']['max_seq_length']}")
 
@@ -98,33 +88,29 @@ def main():
     tokenizer = model_handler.get_tokenizer()
     dataset_processor.tokenizer = tokenizer
 
-    # 3. Batch selection: GPU measurement.
-    print("-" * 10 + "VRAM calibration" + "-" * 10)
+    # 3. Pre-flight fit check at real data lengths.
+    print("-" * 10 + "Fit check" + "-" * 10)
+    from src.train.fit_check import verify_fit
+
+    micro = config["training"]["per_device_train_batch_size"]
     train_texts = list(train_dataset["text"])
-    # Train-split lengths align row-for-row for worst-case probe selection.
-    # (Formatted-set lengths above were only needed for the p95 stats.)
     train_lengths = dataset_processor.calculate_tokens_usage(train_dataset)
+    order = sorted(range(len(train_texts)),
+                   key=lambda i: train_lengths[i], reverse=True)
+    longest_train = [train_texts[i] for i in order[:max(1, micro)]]
     eval_texts = list(eval_dataset["text"])
-
-    result = calibrate(
-        config, model, tokenizer, train_texts, train_lengths, eval_texts,
-        budget_gb, free_before_load=free_before_load,
+    eval_lengths = dataset_processor.calculate_tokens_usage(eval_dataset)
+    longest_eval = eval_texts[max(range(len(eval_texts)),
+                                  key=lambda i: eval_lengths[i])]
+    longest = verify_fit(
+        model, tokenizer, longest_train, longest_eval, micro,
+        config["model"]["max_seq_length"],
+        dtype=config["model"].get("dtype", "bfloat16"),
     )
-
-    config["training"]["per_device_train_batch_size"] = result.micro
-    config["training"]["gradient_accumulation_steps"] = result.accum
-    result.report["backend"] = model_handler.backend_name
-    result.report["free_before_load_gb"] = free_before_load
-    config["_vram_report"] = result.report
-
-    print("-" * 10 + "Memory & Batch Optimization" + "-" * 10)
-    print_sizing_report(
-        result, free_before_load,
-        requested_global_batch=config["training"]["global_batch_size"],
-    )
+    print(f"Fit OK: micro={micro} at real max length {longest} tokens.")
 
     if args.dry_run:
-        print("DRY-RUN: batch decision above, exiting before training.")
+        print("DRY-RUN: fit check above, exiting before training.")
         return
 
     # 4. Training + persistence.
