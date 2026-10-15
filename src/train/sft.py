@@ -88,8 +88,8 @@ class SFTTrain(AbstractSFTTrain):
 
                 print(f"Overriding {variable} with environment variable: {training_config[variable]}")
 
-        # Batch sizes are fixed in config (no auto-sizing): they must be
-        # present and positive after env overrides.
+        # Batch sizes arrive resolved (search or pinned in main.py, env
+        # overrides above): they must be present and positive here.
         micro = training_config.get('per_device_train_batch_size', 0)
         accum = training_config.get('gradient_accumulation_steps', 0)
         if (not isinstance(micro, int) or not isinstance(accum, int)
@@ -231,6 +231,9 @@ class SFTTrain(AbstractSFTTrain):
             except Exception:
                 fingerprint["chunked_loss"] = False
             actuals["arch_fingerprint"] = fingerprint
+            search = self.config.get("_micro_search")
+            if search:
+                actuals["micro_search"] = search
             import json as _json
 
             with open(os.path.join(self.final_path,

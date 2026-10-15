@@ -3,8 +3,10 @@ SFT Template Main Entry Point
 -----------------------------
 1. Dataset processing + exact max_seq_length (real longest sample).
 2. Model load.
-3. Pre-flight fit check at real data lengths (see src/train/fit_check.py).
-4. Train + save. --dry-run runs the fit check and exits.
+3. Micro batch: binary search over [1, global] when
+   training.global_batch_size is set, else pinned micro/accum --
+   always gated by a fit check at real data lengths.
+4. Train + save. --dry-run resolves the batch, runs the gate, exits.
 """
 
 import argparse
@@ -28,8 +30,7 @@ _REQUIRED_KEYS = (
     "model.name",
     "dataset.path",
     "dataset.train_test_split.test_size",
-    "training.per_device_train_batch_size",
-    "training.gradient_accumulation_steps",
+    "training",
     "output.output_dir",
 )
 
@@ -88,29 +89,60 @@ def main():
     tokenizer = model_handler.get_tokenizer()
     dataset_processor.tokenizer = tokenizer
 
-    # 3. Pre-flight fit check at real data lengths.
-    print("-" * 10 + "Fit check" + "-" * 10)
-    from src.train.fit_check import verify_fit
+    # 3. Micro batch: config-key dispatch. global_batch_size present ->
+    # binary-search the largest fitting micro in [1, global] (accum
+    # derived, effective batch unchanged). Absent -> pinned micro/accum
+    # (no search). Both/neither is a config error.
+    print("-" * 10 + "Micro batch" + "-" * 10)
+    from src.train.fit_check import (
+        find_best_micro, resolve_batch_mode, verify_fit)
 
-    micro = config["training"]["per_device_train_batch_size"]
+    training = config["training"]
+    mode, value = resolve_batch_mode(training)
+
     train_texts = list(train_dataset["text"])
     train_lengths = dataset_processor.calculate_tokens_usage(train_dataset)
     order = sorted(range(len(train_texts)),
                    key=lambda i: train_lengths[i], reverse=True)
-    longest_train = [train_texts[i] for i in order[:max(1, micro)]]
     eval_texts = list(eval_dataset["text"])
     eval_lengths = dataset_processor.calculate_tokens_usage(eval_dataset)
     longest_eval = eval_texts[max(range(len(eval_texts)),
                                   key=lambda i: eval_lengths[i])]
-    longest = verify_fit(
-        model, tokenizer, longest_train, longest_eval, micro,
-        config["model"]["max_seq_length"],
-        dtype=config["model"].get("dtype", "bfloat16"),
-    )
-    print(f"Fit OK: micro={micro} at real max length {longest} tokens.")
+    max_len = config["model"]["max_seq_length"]
+    dtype = config["model"].get("dtype", "bfloat16")
+
+    if mode == "search":
+        window = min(value, len(train_texts))
+        longest_train = [train_texts[i] for i in order[:window]]
+        micro, accum, longest, tried, probed_max = find_best_micro(
+            model, tokenizer, longest_train, longest_eval, max_len,
+            value, dtype=dtype)
+        trace = " -> ".join(
+            f"{m} {'OK' if state == 'OK' else 'OOM'}"
+            for m, state in tried)
+        extra = (f" (backed off from probed max {probed_max})"
+                 if probed_max != micro else "")
+        print(f"Micro search [{trace}] => micro={micro}, accum={accum} "
+              f"(global={micro * accum}) at real max length "
+              f"{longest}{extra}.")
+        training["per_device_train_batch_size"] = micro
+        training["gradient_accumulation_steps"] = accum
+        config["_micro_search"] = {
+            "global_batch_size": training["global_batch_size"],
+            "searched_micro": micro,
+            "probed_max": probed_max,
+            "candidates_tried": [list(t) for t in tried],
+        }
+    else:
+        micro = training["per_device_train_batch_size"]
+        longest_train = [train_texts[i] for i in order[:max(1, micro)]]
+        longest = verify_fit(
+            model, tokenizer, longest_train, longest_eval, micro,
+            max_len, dtype=dtype)
+        print(f"Fit OK: micro={micro} at real max length {longest} tokens.")
 
     if args.dry_run:
-        print("DRY-RUN: fit check above, exiting before training.")
+        print("DRY-RUN: batch resolved and gated above, exiting.")
         return
 
     # 4. Training + persistence.
