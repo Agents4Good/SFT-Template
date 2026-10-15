@@ -120,10 +120,10 @@ def main():
         trace = " -> ".join(
             f"{m} {'OK' if state == 'OK' else 'OOM'}"
             for m, state in tried)
-        extra = (f" (backed off from probed max {probed_max})"
+        extra = (f" (edge {probed_max}, sustained check passed at {micro})"
                  if probed_max != micro else "")
         print(f"Micro search [{trace}] => micro={micro}, accum={accum} "
-              f"(global={micro * accum}) at real max length "
+              f"(effective={micro * accum} of {value}) at real max length "
               f"{longest}{extra}.")
         training["per_device_train_batch_size"] = micro
         training["gradient_accumulation_steps"] = accum
@@ -131,6 +131,7 @@ def main():
             "global_batch_size": training["global_batch_size"],
             "searched_micro": micro,
             "probed_max": probed_max,
+            "effective_batch_size": micro * accum,
             "candidates_tried": [list(t) for t in tried],
         }
     else:

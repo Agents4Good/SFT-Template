@@ -12,10 +12,11 @@ dataset:
 
 training:
   # Exactly ONE batch mode. With global_batch_size set (below), main
-  # binary-searches the largest fitting micro in [1, global] over its
-  # divisors and derives gradient_accumulation_steps = global / micro,
-  # so the effective batch never changes. Without it, delete the key
-  # and set per_device_train_batch_size + gradient_accumulation_steps
+  # binary-searches the largest fitting micro in [1, global] by plain
+  # halving and trains one below it; gradient_accumulation_steps =
+  # global // micro (floor), so the effective batch lands at or below
+  # global and is reported. Without it, delete the key and set
+  # per_device_train_batch_size + gradient_accumulation_steps
   # explicitly to pin them (no search, e.g. micro=4/accum=16).
   global_batch_size: 64
   optim: "adamw_8bit"
