@@ -1,132 +1,115 @@
-from trl import SFTTrainer
-from transformers import TrainingArguments, EarlyStoppingCallback
-from core.base import AbstractSFTTrain
+"""SFT orchestration: run artifacts, the training loop, and save/push."""
+
+import ast
 import datetime
 import os
-import ast
 import shutil
 
+from transformers import set_seed
+
+from src.core.base import AbstractSFTTrain
+from src.train import telemetry
+from src.utils.push import push_model
+
+
 class SFTTrain(AbstractSFTTrain):
-    """
-    Handles the Supervised Fine-Tuning (SFT) training cycle.
-    
+    """Runs a trainer that has already been sized and promoted.
+
     This class manages:
     - Overriding training parameters via environment variables.
     - Setting up output directories with timestamp suffixes.
-    - Configuring the Trainer object from the Transformers/TRL library.
     - Executing training and saving the final model.
     """
 
     def __init__(self, config, model, tokenizer, train_dataset, eval_dataset):
-        """
-        Initializes the SFT trainer wrapper.
-        
-        Args:
-            config (dict): The project configuration.
-            model: The PEFT-wrapped model instance.
-            tokenizer: The model's tokenizer.
-            train_dataset: The processed training dataset.
-            eval_dataset: The processed evaluation dataset.
-        """
         self.config = config
         self.model = model
         self.tokenizer = tokenizer
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.trainer = None
-        # Unique timestamp for each training run
+        self._env_applied = False
         self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.final_path = f"{self.config['output']['output_dir']}/run-{self.timestamp}"
+        self.final_path = f"{config['output']['output_dir']}/run-{self.timestamp}"
 
-    def train(self):
-        """
-        Prepares and executes the training process.
-        - Applies environment variable overrides if present (e.g., LEARNING_RATE).
-        - Creates the output directory and backups config/data.
-        - Initializes the SFTTrainer and starts the loop.
-        """
+    def apply_env_overrides(self):
+        """Apply environment-variable overrides once, in place."""
         training_config = self.config['training']
-        
-        # Override config parameters with environment variables for flexible scaling
+        if self._env_applied:
+            return training_config
+
         for variable in training_config.keys():
             environment_value = os.getenv(variable.upper())
 
             if environment_value:
                 try:
-                    # Parse numerical or complex types using literal_eval
-                    training_config[variable] = ast.literal_eval(environment_value)
-                except:
+                    training_config[variable] = ast.literal_eval(
+                        environment_value)
+                except (ValueError, SyntaxError):
                     training_config[variable] = environment_value
 
-                print(f"Overriding {variable} with environment variable: {training_config[variable]}")
+                print(f"Overriding {variable} with environment variable: "
+                      f"{training_config[variable]}")
+        self._env_applied = True
+        return training_config
 
-        # Finalize path again to ensure accuracy at training start
-        self.timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.final_path = f"{self.config['output']['output_dir']}/run-{self.timestamp}"
+    @staticmethod
+    def _validate_batch(training):
+        micro = training.get('per_device_train_batch_size', 0)
+        accum = training.get('gradient_accumulation_steps', 0)
+        if (not isinstance(micro, int) or not isinstance(accum, int)
+                or micro <= 0 or accum <= 0):
+            raise ValueError(
+                "training.per_device_train_batch_size and "
+                "training.gradient_accumulation_steps must be positive "
+                f"ints, got {micro!r} and {accum!r}.")
 
-        # Setup directory structure and metadata backups
+    def _prepare_run_dir(self):
         os.makedirs(self.final_path, exist_ok=True)
         if self.config['output']['save_config']:
-            shutil.copy2('./src/config.yaml', os.path.join(self.final_path, 'config.yaml'))
-        
+            import yaml
+
+            # Persist the live config (includes env overrides) rather
+            # than the stale on-disk file.
+            with open(os.path.join(self.final_path, 'config.yaml'), 'w') as f:
+                yaml.safe_dump(
+                    {k: v for k, v in self.config.items()
+                     if not k.startswith('_')},
+                    f,
+                )
+
         # Only try to copy the dataset if it refers to a local path
-        if self.config['output']['save_dataset'] and os.path.exists(self.config['dataset']['path']):
+        if (self.config['output']['save_dataset']
+                and os.path.exists(self.config['dataset']['path'])):
             shutil.copy2(self.config['dataset']['path'], self.final_path)
-        
-        # Initialize training arguments from configuration
-        args = TrainingArguments(
-            output_dir=self.final_path,
-            overwrite_output_dir=True,
-            per_device_train_batch_size=training_config['per_device_train_batch_size'],
-            gradient_accumulation_steps=training_config['gradient_accumulation_steps'],
-            optim=training_config['optim'],
-            learning_rate=float(training_config['learning_rate']),
-            weight_decay=training_config['weight_decay'],
-            lr_scheduler_type=training_config['lr_scheduler_type'],
-            warmup_steps=training_config['warmup_steps'],
-            logging_steps=training_config['logging_steps'],
-            num_train_epochs=training_config['num_train_epochs'],
-            max_steps=training_config['max_steps'],
-            fp16=training_config['fp16'],
-            bf16=training_config['bf16'],
-            eval_strategy=training_config['eval_strategy'],
-            eval_steps=training_config['eval_steps'],
-            save_strategy=training_config['save_strategy'],
-            save_steps=training_config['save_steps'],
-            load_best_model_at_end=training_config['load_best_model_at_end'],
-            metric_for_best_model=training_config['metric_for_best_model'],
-            push_to_hub=training_config['push_to_hub'],
-            report_to=training_config['report_to'],
-            gradient_checkpointing=self.config['peft']['use_gradient_checkpointing'],
-            max_grad_norm=training_config['max_grad_norm'],
-        )
 
-        callbacks = []
-        if training_config.get('early_stopping', {}).get('enabled', False):
-            callbacks.append(EarlyStoppingCallback(
-                early_stopping_patience=training_config['early_stopping']['patience'],
-                early_stopping_threshold=training_config['early_stopping']['threshold']
-            ))
+    def train(self, trainer, preflight=None):
+        """Train `trainer` and record the run's measured actuals."""
+        training_config = self.apply_env_overrides()
+        self._validate_batch(training_config)
+        self._prepare_run_dir()
 
-        # Build SFTTrainer
-        self.trainer = SFTTrainer(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            train_dataset=self.train_dataset,
-            eval_dataset=self.eval_dataset,
-            dataset_text_field="text",
-            max_seq_length=self.config['model']['max_seq_length'],
-            args=args,
-            packing=False,
-            callbacks=callbacks,
-        )
+        self.trainer = trainer
+        import torch
 
-        # Execute training
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        set_seed(self.trainer.args.seed)
         self.trainer.train()
 
-    def save_model(self): 
-        """
-        Saves the trainer's model weights to the final destination directory.
-        """
-        self.trainer.save_model(self.final_path + "/Model")
+        telemetry.record_training_actuals(
+            self.final_path, self.model, self.config, preflight=preflight)
+
+    def save_model(self):
+        """Save the trained weights and optionally push them to the Hub."""
+        model_dir = self.final_path + "/Model"
+        self.trainer.save_model(model_dir)
         print(f"Model saved successfully to {self.final_path}!")
+        push_cfg = (self.config.get("output") or {}).get("push") or {}
+        if push_cfg.get("enabled", False):
+            push_model(
+                model_dir,
+                push_cfg.get("repo_id"),
+                revision=push_cfg.get("revision", "main"),
+                private=push_cfg.get("private", False),
+            )

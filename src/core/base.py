@@ -36,17 +36,6 @@ class AbstractDatasetProcessor(ABC):
         """
         pass
 
-    @abstractmethod
-    def save_dataset(self, dataset, path: str):
-        """
-        Saves the processed dataset to disk.
-        
-        Args:
-            dataset: The processed dataset object.
-            path (str): Destination path for saving.
-        """
-        pass
-
 class AbstractSFTTrain(ABC):
     """
     Abstract base class for Supervised Fine-Tuning.
@@ -65,4 +54,34 @@ class AbstractSFTTrain(ABC):
         """
         Saves the fine-tuned model and configuration.
         """
+        pass
+
+class AbstractModel(ABC):
+    """
+    Handles model loading and configuration (any backend: Unsloth, HF+PEFT).
+
+    This class is responsible for initializing the pre-trained model and tokenizer,
+    applying PEFT/LoRA configurations, and providing access to the loaded model.
+    """
+
+    @property
+    def backend_name(self):
+        """Backend identifier for logging/VRAM reports. Overridden by loaders."""
+        return "unknown"
+
+    @abstractmethod
+    def load_model(self):
+        """
+        Loads the pre-trained model and applies PEFT configurations.
+        """
+        pass
+
+    @abstractmethod
+    def get_model(self):
+        """Returns the loaded model instance."""
+        pass
+
+    @abstractmethod
+    def get_tokenizer(self):
+        """Returns the loaded tokenizer instance."""
         pass
