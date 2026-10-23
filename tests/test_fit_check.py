@@ -1,337 +1,35 @@
-"""GPU-free tests for the pre-flight fit check (real lengths, no padding)."""
+"""GPU-free tests for measured pre-flight micro-batch sizing."""
 
 import os
 import sys
-import types
-from contextlib import nullcontext
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.train.fit_check import (
-    FitError, find_best_micro, resolve_batch_mode, verify_fit)
-
-
-class _FakeTensor:
-    def __init__(self, shape):
-        self.shape = tuple(shape)
-        self.setitem_calls = []
-
-    def to(self, device):
-        return self
-
-    def clone(self):
-        return _FakeTensor(self.shape)
-
-    def __eq__(self, other):
-        return _FakeMask()
-
-    def __setitem__(self, key, value):
-        self.setitem_calls.append(value)
-
-
-class _FakeMask:
-    pass
-
-
-class _FakeParam:
-    def __init__(self):
-        self.grad = None
-        self.device = "cuda"
-
-
-class _FakeLoss:
-    def __init__(self, model):
-        self.model = model
-
-    def backward(self):
-        self.model.backward_calls += 1
-        for param in self.model.parameters():
-            param.grad = object()
-
-
-class _FakeOptim:
-    last = None
-
-    def __init__(self, params, lr=0.0):
-        self.params = list(params)
-        self.lr = lr
-        self.step_calls = 0
-        _FakeOptim.last = self
-
-    def step(self):
-        self.step_calls += 1
-
-    def zero_grad(self, set_to_none=False):
-        pass
-
-
-class _StubModel:
-    def __init__(self, oom_at=None, oom_calls=()):
-        self.params = [_FakeParam()]
-        self.mode = None
-        self.backward_calls = 0
-        self.forward_calls = 0
-        self.oom_at = oom_at
-        self.oom_calls = set(oom_calls)
-
-    def parameters(self):
-        return iter(self.params)
-
-    def train(self):
-        self.mode = "train"
-
-    def eval(self):
-        self.mode = "eval"
-
-    def __call__(self, **kwargs):
-        self.forward_calls += 1
-        ids = kwargs.get("input_ids")
-        n = ids.shape[0] if ids is not None else 0
-        if ((self.oom_at is not None and n >= self.oom_at)
-                or self.forward_calls in self.oom_calls):
-            raise RuntimeError("CUDA out of memory: stub OOM")
-        from types import SimpleNamespace
-        return SimpleNamespace(loss=_FakeLoss(self))
-
-
-class _StubTok:
-    def __call__(self, text, truncation=True, max_length=None,
-                 padding="longest", return_tensors="pt"):
-        longest = min(max_length or 0, max(len(t) for t in text))
-        return {"input_ids": _FakeTensor((len(text), longest))}
-
-
-def _stub_torch(monkeypatch, cuda=True):
-    mod = types.ModuleType("torch")
-    mod.float32 = "float32"
-    mod.bfloat16 = "bfloat16"
-
-    class _Cuda:
-        total_memory = 12 * 1024**3
-        peak_script = []
-
-        @staticmethod
-        def is_available():
-            return cuda
-
-        @staticmethod
-        def synchronize():
-            return None
-
-        @staticmethod
-        def empty_cache():
-            return None
-
-        @classmethod
-        def reset_peak_memory_stats(cls):
-            return None
-
-        @classmethod
-        def max_memory_allocated(cls):
-            if cls.peak_script:
-                return cls.peak_script.pop(0)
-            return 0
-
-        @staticmethod
-        def get_device_properties(dev):
-            return types.SimpleNamespace(
-                total_memory=_Cuda.total_memory)
-
-    mod.cuda = _Cuda
-    mod.autocast = lambda **kwargs: nullcontext()
-    mod.no_grad = lambda: nullcontext()
-    mod.optim = types.SimpleNamespace(AdamW=_FakeOptim)
-    _FakeOptim.last = None
-    monkeypatch.setitem(sys.modules, "torch", mod)
-    return mod
-
-
-def _gb(*values):
-    return [int(v * 1024**3) for v in values]
-
-
-def test_fit_passes_at_real_length(monkeypatch):
-    _stub_torch(monkeypatch)
-    model = _StubModel()
-    # Caller pre-selects the longest texts (main.py sorts row lengths).
-    longest = verify_fit(
-        model, _StubTok(), ["aaaaaa", "aaaa"], "bb", micro=2,
-        max_length=512)
-    # micro=2 longest texts: 6 and 4 chars -> padded to true max 6.
-    assert longest == 6
-    assert model.backward_calls == 1
-    assert model.forward_calls == 2  # one train step + one eval forward
-    assert model.mode == "train"  # restored for training
-    assert model.params[0].grad is None  # grads cleared afterwards
-
-
-def test_verify_fit_sustained_loop_with_optim(monkeypatch):
-    _stub_torch(monkeypatch)
-    model = _StubModel()
-    longest = verify_fit(model, _StubTok(), ["aaaa", "bb"], "cc", micro=2,
-                         max_length=512, train_steps=3,
-                         materialize_optim=True)
-    assert longest == 4
-    assert model.backward_calls == 3
-    assert model.forward_calls == 4  # 3 train steps + 1 eval forward
-    # lr=0.0: optimizer states allocate, weights stay untouched.
-    assert _FakeOptim.last is not None
-    assert _FakeOptim.last.lr == 0.0
-    assert _FakeOptim.last.step_calls == 1
-    assert model.params[0].grad is None
-
-
-def test_fit_oom_raises_actionable_error(monkeypatch):
-    _stub_torch(monkeypatch)
-    model = _StubModel(oom_at=2)
-    with pytest.raises(FitError, match="micro=2"):
-        verify_fit(model, _StubTok(), ["aa", "aaaa"], "bb", micro=2,
-                   max_length=512)
-    try:
-        verify_fit(model, _StubTok(), ["aa", "aaaa"], "bb", micro=2,
-                   max_length=512)
-    except FitError as exc:
-        assert "per_device_train_batch_size" in str(exc)
-    assert model.params[0].grad is None
-
-
-def test_fit_without_cuda_fails(monkeypatch):
-    _stub_torch(monkeypatch, cuda=False)
-    with pytest.raises(FitError, match="CUDA"):
-        verify_fit(_StubModel(), _StubTok(), ["aa"], None, micro=1,
-                   max_length=512)
-
-
-def test_fit_without_eval_text_skips_eval(monkeypatch):
-    _stub_torch(monkeypatch)
-    model = _StubModel()
-    longest = verify_fit(model, _StubTok(), ["aaaa"], None, micro=1,
-                         max_length=512)
-    assert longest == 4
-    assert model.forward_calls == 1
-
-
-def test_search_rejects_bad_global_batch(monkeypatch):
-    _stub_torch(monkeypatch)
-    for bad in (0, -4, 4.5, "64", None):
-        with pytest.raises(ValueError, match="positive int"):
-            find_best_micro(_StubModel(), _StubTok(), ["aa"], "bb",
-                            512, bad)
-
-
-def test_search_halves_live_interval(monkeypatch):
-    mod = _stub_torch(monkeypatch)
-    model = _StubModel(oom_at=51)
-    texts = ["x" * 600] * 64
-    # Peaks (GB) for the passing walk probes 32/48/50 in order.
-    mod.cuda.peak_script = _gb(5.0, 8.0, 10.6)
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        model, _StubTok(), texts, "yy", 512, 64)
-    # Plain halving over [1, 64], edge at 50: 32/48/56/52/50/51.
-    # 51 is not a divisor of anything -- it was probed anyway.
-    assert tried[:-1] == [(32, "OK"), (48, "OK"), (56, "OOM"),
-                          (52, "OOM"), (50, "OK"), (51, "OOM")]
-    assert probed_max == 50
-    # Headroom gate (5 GB of 12): 50 needs 15.6, 48 needs 13 -> out;
-    # 32 needs 10.0, confirmed sustained.
-    assert tried[-1] == (32, "OK")
-    assert (micro, accum) == (32, 2)
-    assert micro * accum <= 64
-    assert longest == 512
-
-
-def test_search_first_probe_is_live_midpoint(monkeypatch):
-    mod = _stub_torch(monkeypatch)
-    model = _StubModel(oom_at=55)
-    texts = ["x" * 600] * 96
-    # Peaks for passing probes 48/54 in order.
-    mod.cuda.peak_script = _gb(3.0, 10.9)
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        model, _StubTok(), texts, "yy", 512, 96)
-    # (1 + 96) // 2 = 48: the first probe is 48, organically.
-    assert tried[0] == (48, "OK")
-    assert tried[:-1] == [(48, "OK"), (72, "OOM"), (60, "OOM"),
-                          (54, "OK"), (57, "OOM"), (55, "OOM")]
-    assert probed_max == 54
-    # 54 needs 15.9 GB -> out; 48 needs 8.0, confirmed sustained.
-    assert tried[-1] == (48, "OK")
-    assert (micro, accum) == (48, 2)
-
-
-def test_search_confirms_margin_below_edge(monkeypatch):
-    mod = _stub_torch(monkeypatch)
-    model = _StubModel(oom_at=24)
-    texts = ["x" * 600] * 100
-    # Peaks for passing probes 12/18/21/23 in order.
-    mod.cuda.peak_script = _gb(3.0, 5.0, 8.8, 10.8)
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        model, _StubTok(), texts, "yy", 512, 100)
-    assert tried[:-1] == [(50, "OOM"), (25, "OOM"), (12, "OK"),
-                          (18, "OK"), (21, "OK"), (23, "OK"),
-                          (24, "OOM")]
-    assert probed_max == 23
-    # 23 needs 15.8, 21 needs 13.8 -> out; 18 needs 10.0, sustained OK.
-    assert tried[-1] == (18, "OK")
-    assert len(tried) == 8
-    assert (micro, accum) == (18, 5)
-    assert micro * accum <= 100
-
-
-def test_search_steps_one_below_top(monkeypatch):
-    mod = _stub_torch(monkeypatch)
-    # Peaks for passing probes 4/6/7/8 in order: 8 leaves no headroom.
-    mod.cuda.peak_script = _gb(1.0, 2.0, 9.5, 11.0)
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        _StubModel(), _StubTok(), ["a" * 8, "a" * 7], "bb", 512, 8)
-    # Halving over [1, 8], all pass: edge unobserved.
-    assert tried[:-1] == [(4, "OK"), (6, "OK"), (7, "OK"), (8, "OK")]
-    assert probed_max == 8
-    # 8 needs 16, 7 needs 14.5 -> out; 6 needs 7.0, sustained OK.
-    assert tried[-1] == (6, "OK")
-    assert (micro, accum) == (6, 1)
-
-
-def test_search_walks_down_past_fragile_micros(monkeypatch):
-    mod = _stub_torch(monkeypatch)
-    # Rows fit singly, but the first sustained loop fails on call 5:
-    # peaks reject 8 and 7 at the gate, the sustained confirm of 6
-    # then fails, and 4 survives. eval=None keeps call counting to
-    # train forwards only.
-    mod.cuda.peak_script = _gb(1.0, 2.0, 9.5, 11.0)
-    model = _StubModel(oom_calls={5})
-    texts = ["x" * 600] * 8
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        model, _StubTok(), texts, None, 512, 8)
-    assert tried == [(4, "OK"), (6, "OK"), (7, "OK"), (8, "OK"),
-                     (6, "OOM"), (4, "OK")]
-    assert probed_max == 8
-    assert (micro, accum) == (4, 2)
-    assert micro * accum <= 8
-
-
-def test_search_fails_when_sustained_keeps_ooming(monkeypatch):
-    _stub_torch(monkeypatch)
-    model = _StubModel(oom_calls={2, 3, 4, 5, 6, 7, 8, 9, 10})
-    with pytest.raises(FitError, match="keeps OOMing"):
-        find_best_micro(model, _StubTok(), ["aa", "bb"], None, 512, 2)
-
-
-def test_search_floors_at_one(monkeypatch):
-    _stub_torch(monkeypatch)
-    micro, accum, longest, tried, probed_max = find_best_micro(
-        _StubModel(), _StubTok(), ["aaaa"], "bb", 512, 1)
-    assert (micro, accum, probed_max) == (1, 1, 1)
-    # No room below: the sustained confirm re-probes 1 and passes.
-    assert tried == [(1, "OK"), (1, "OK")]
-
-
-def test_search_fails_when_micro_1_ooms(monkeypatch):
-    _stub_torch(monkeypatch)
-    with pytest.raises(FitError, match="even micro=1 OOMs at 4 tokens"):
-        find_best_micro(_StubModel(oom_at=1), _StubTok(),
-                        ["aaaa", "bb"], "cc", 512, 8)
+    FitError, check_pinned, find_best_micro, resolve_batch_mode)
+
+
+class Probe:
+    """Fake probe: per-micro peak sequences, optional OOM at some micros."""
+
+    def __init__(self, peaks=None, oom=()):
+        self.peaks = {m: list(v) for m, v in (peaks or {}).items()}
+        self.oom = set(oom)
+        self.calls = []
+
+    def __call__(self, micro):
+        self.calls.append(micro)
+        if micro in self.oom:
+            exc = FitError(f"OOM at micro={micro}")
+            exc.longest_tokens = 550
+            raise exc
+        return {
+            "peak_gb": self.peaks[micro].pop(0),
+            "duration_s": 1.25,
+            "steps": 3,
+        }
 
 
 def test_resolve_batch_mode_dispatch():
@@ -348,3 +46,129 @@ def test_resolve_batch_mode_dispatch():
                 {"global_batch_size": 64, **fixed}):
         with pytest.raises(ValueError, match="exactly one batch mode"):
             resolve_batch_mode(bad)
+
+
+@pytest.mark.parametrize("global_batch", [0, -4, 4.5, "64", None])
+def test_search_rejects_bad_global_batch(global_batch):
+    with pytest.raises(ValueError, match="positive int"):
+        find_best_micro(Probe(), 10.0, global_batch)
+
+
+@pytest.mark.parametrize("max_micro", [0, -2])
+def test_search_rejects_bad_max_micro(max_micro):
+    with pytest.raises(ValueError, match="at least 1"):
+        find_best_micro(Probe(), 10.0, 8, max_micro=max_micro)
+
+
+@pytest.mark.parametrize("usable,reserve", [
+    (0, 0.10), (-1, 0.10), (10, 1.0), (10, -0.10), (10, "0.1"),
+])
+def test_search_rejects_bad_memory_limit(usable, reserve):
+    with pytest.raises((ValueError, TypeError)):
+        find_best_micro(Probe(), usable, 8, reserve_fraction=reserve)
+
+
+def test_search_all_fit_picks_global_without_confirm():
+    probe = Probe({4: [4.0], 6: [6.0], 7: [7.0], 8: [8.0]})
+    report = find_best_micro(probe, 10.0, 8, reserve_fraction=0.10)
+    # 10 GB usable - 10% = 9 GB limit; the binary walk ends at 8.
+    assert probe.calls == [4, 6, 7, 8]
+    assert report["micro"] == 8
+    assert report["accum"] == 1
+    assert report["effective_batch_size"] == 8
+    assert report["limit_gb"] == pytest.approx(9.0)
+    assert report["confirm"] is None
+    assert [c["result"] for c in report["candidates"]] == [
+        "pass", "pass", "pass", "pass"]
+    assert report["candidates"][-1]["peak_reserved_gb"] == 8.0
+
+
+def test_search_walks_down_and_confirms_warm_cache():
+    probe = Probe({4: [4.0], 6: [6.0], 7: [7.0, 7.0], 8: [10.0]})
+    report = find_best_micro(probe, 10.0, 8, reserve_fraction=0.10)
+    # 4/6/7 pass, 8 is over the 9 GB limit, so 7 is re-probed warm.
+    assert probe.calls == [4, 6, 7, 8, 7]
+    assert report["micro"] == 7
+    assert report["accum"] == 1
+    assert report["confirm"]["result"] == "confirm-pass"
+    assert [(c["micro"], c["result"]) for c in report["candidates"]] == [
+        (4, "pass"), (6, "pass"), (7, "pass"), (8, "over"),
+        (7, "confirm-pass")]
+
+
+def test_search_fails_when_warm_confirm_exceeds_limit():
+    probe = Probe({4: [4.0], 6: [6.0], 7: [7.0, 9.5], 8: [10.0]})
+    with pytest.raises(FitError, match="warm-cache confirm"):
+        find_best_micro(probe, 10.0, 8, reserve_fraction=0.10)
+    assert probe.calls == [4, 6, 7, 8, 7]
+
+
+def test_search_skips_oom_candidates():
+    probe = Probe({2: [2.0, 2.0], 1: [1.0]}, oom={4, 3})
+    report = find_best_micro(probe, 10.0, 8, reserve_fraction=0.10)
+    assert probe.calls == [4, 2, 3, 2]
+    assert report["micro"] == 2
+    assert report["accum"] == 4
+    assert report["candidates"][0]["result"] == "oom"
+    assert report["candidates"][0]["longest_tokens"] == 550
+    assert [(c["micro"], c["result"]) for c in report["candidates"]] == [
+        (4, "oom"), (2, "pass"), (3, "oom"), (2, "confirm-pass")]
+
+
+def test_search_fails_when_micro_1_ooms():
+    probe = Probe(oom={2, 1})
+    with pytest.raises(FitError, match="no candidate") as info:
+        find_best_micro(probe, 10.0, 4, reserve_fraction=0.10)
+    assert probe.calls == [2, 1]
+    assert "Tried" in str(info.value)
+
+
+def test_search_caps_max_micro_to_global_and_reports_floor_accum():
+    probe = Probe({4: [4.0], 2: [2.0], 3: [3.0]})
+    report = find_best_micro(
+        probe, 10.0, 10, reserve_fraction=0.10, max_micro=4)
+    # max_micro is capped to global; the winner <= max_micro.
+    assert probe.calls == [2, 3, 4]
+    assert report["max_micro"] == 4
+    assert report["micro"] == 4
+    assert report["accum"] == 2
+    assert report["effective_batch_size"] == 8
+
+
+def test_search_budget_is_min_probes_for_global_64():
+    probe = Probe({m: [m / 8.0] for m in range(1, 65)})
+    report = find_best_micro(probe, 10.0, 64, reserve_fraction=0.10)
+    # 64 max candidates, 9 GB limit -> 64 peaks at 8 GB and fits. The
+    # binary walk is 6 probes (32, 48, 56, 60, 62, 63) plus 64 = 7,
+    # no warm confirm because 64 is the final probe.
+    assert report["micro"] == 64
+    assert report["candidates"][-1]["result"] == "pass"
+    assert len(probe.calls) == 7
+
+
+def test_pinned_pass_reports_measurement():
+    probe = Probe({4: [6.5]})
+    report = check_pinned(probe, 4, 10.0, reserve_fraction=0.10)
+    assert probe.calls == [4]
+    assert report["micro"] == 4
+    assert report["peak_reserved_gb"] == 6.5
+    assert report["limit_gb"] == pytest.approx(9.0)
+    assert report["usable_gb"] == 10.0
+    assert report["reserve_fraction"] == 0.10
+
+
+def test_pinned_over_limit_raises():
+    with pytest.raises(FitError, match="exceeds") as info:
+        check_pinned(Probe({4: [9.5]}), 4, 10.0, reserve_fraction=0.10)
+    assert "per_device_train_batch_size" in str(info.value)
+
+
+def test_pinned_oom_raises():
+    with pytest.raises(FitError, match="CUDA out of memory"):
+        check_pinned(Probe(oom={4}), 4, 10.0, reserve_fraction=0.10)
+
+
+@pytest.mark.parametrize("micro", [0, -1, 2.5, "4", None])
+def test_pinned_rejects_bad_micro(micro):
+    with pytest.raises(ValueError, match="positive int"):
+        check_pinned(Probe(), micro, 10.0)

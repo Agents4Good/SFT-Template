@@ -3,18 +3,27 @@ SFT Template Main Entry Point
 -----------------------------
 1. Dataset processing + exact max_seq_length (real longest sample).
 2. Model load.
-3. Micro batch: binary search over [1, global] when
-   training.global_batch_size is set, else pinned micro/accum --
-   always gated by a fit check at real data lengths.
-4. Train + save. --dry-run resolves the batch, runs the gate, exits.
+3. Micro batch: every candidate runs real Trainer steps at the longest
+   training shapes and is gated against measured usable VRAM. With
+   training.global_batch_size set the largest fitting micro is selected;
+   without it a pinned micro/accum pair is fit-checked once.
+4. Train + save. --dry-run resolves the batch, writes preflight.json,
+   and exits.
 """
 
 import argparse
+import datetime
 
 import yaml
 
 from src.dataset.processor import DatasetProcessor
+from src.train.fit_check import (
+    check_pinned, find_best_micro, resolve_batch_mode)
+from src.train.probe import ProbeSession, usable_memory_gb
 from src.train.sft import SFTTrain
+from src.train.telemetry import write_preflight
+from src.train.trainer import (
+    build_args, build_callbacks, build_trainer, close_trainer, promote_trainer)
 
 
 def _lookup(config, dotted):
@@ -45,12 +54,59 @@ def load_config(path):
     return config
 
 
+def _base_preflight(config, backend_name, device_total_gb, probe_steps,
+                    created):
+    return {
+        "created": created,
+        "model": config["model"]["name"],
+        "backend": backend_name,
+        "device_total_gb": device_total_gb,
+        "probe_steps": probe_steps,
+    }
+
+
+def _search_preflight(config, backend_name, device_total_gb, probe_steps,
+                      created, result):
+    report = _base_preflight(
+        config, backend_name, device_total_gb, probe_steps, created)
+    report["mode"] = "search"
+    report.update(result)
+    return report
+
+
+def _fixed_preflight(config, backend_name, device_total_gb, probe_steps,
+                     created, micro, accum, check):
+    report = _base_preflight(
+        config, backend_name, device_total_gb, probe_steps, created)
+    report.update({
+        "mode": "fixed",
+        "global_batch_size": None,
+        "max_micro": micro,
+        "selected_micro": micro,
+        "gradient_accumulation_steps": accum,
+        "effective_batch_size": micro * accum,
+        "usable_gb": check["usable_gb"],
+        "reserve_fraction": check["reserve_fraction"],
+        "limit_gb": check["limit_gb"],
+        "candidates": [{
+            "micro": micro,
+            "result": "pass",
+            "peak_reserved_gb": check["peak_reserved_gb"],
+            "duration_s": check["duration_s"],
+            "steps": probe_steps,
+        }],
+        "confirm": None,
+    })
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run SFT Training")
     parser.add_argument("--config", type=str, default="src/config.yaml",
                         help="Path to config file")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Fit check at real lengths, print, exit")
+                        help="Run the measured fit check, write "
+                             "preflight.json, and exit")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -65,9 +121,9 @@ def main():
     eval_dataset = split_dataset["test"]
 
     # Exact sequence length: tokenize the final texts and take the real
-    # max. No percentile, no truncation surprises -- the fit check below
-    # tests this exact length, which (under length-grouped batching) is
-    # also the true worst case. An explicit config value is respected.
+    # max. The Trainer probes below run at this exact length, which
+    # (under length-grouped batching) is also the true worst case. An
+    # explicit config value is respected.
     if config["model"].get("max_seq_length") is None:
         print("Measuring exact sequence lengths from dataset...")
         lengths = dataset_processor.calculate_tokens_usage(
@@ -89,72 +145,93 @@ def main():
     tokenizer = model_handler.get_tokenizer()
     dataset_processor.tokenizer = tokenizer
 
-    # 3. Micro batch: config-key dispatch. global_batch_size present ->
-    # binary-search the largest fitting micro in [1, global] (accum
-    # derived, effective batch unchanged). Absent -> pinned micro/accum
-    # (no search). Both/neither is a config error.
+    # 3. Micro batch: probe the real Trainer path. Env overrides are
+    # applied before mode dispatch so GLOBAL_BATCH_SIZE etc. participate.
     print("-" * 10 + "Micro batch" + "-" * 10)
-    from src.train.fit_check import (
-        find_best_micro, resolve_batch_mode, verify_fit)
-
-    training = config["training"]
+    sft = SFTTrain(config, model, tokenizer, train_dataset, eval_dataset)
+    training = sft.apply_env_overrides()
     mode, value = resolve_batch_mode(training)
+    usable_gb, device_total_gb = usable_memory_gb()
+    reserve = float(training.get("vram_reserve_fraction", 0.10))
+    probe_steps = int(training.get("probe_steps", 3))
+    created = datetime.datetime.now().isoformat(timespec="seconds")
 
-    train_texts = list(train_dataset["text"])
-    train_lengths = dataset_processor.calculate_tokens_usage(train_dataset)
-    order = sorted(range(len(train_texts)),
-                   key=lambda i: train_lengths[i], reverse=True)
-    eval_texts = list(eval_dataset["text"])
-    eval_lengths = dataset_processor.calculate_tokens_usage(eval_dataset)
-    longest_eval = eval_texts[max(range(len(eval_texts)),
-                                  key=lambda i: eval_lengths[i])]
-    max_len = config["model"]["max_seq_length"]
-    dtype = config["model"].get("dtype", "bfloat16")
+    def probe_trainer(tmp_dir, steps):
+        probe_args = build_args(
+            config, 1, 1, tmp_dir, probe=True, probe_steps=steps)
+        return build_trainer(
+            model, tokenizer, train_dataset, eval_dataset, probe_args)
 
-    if mode == "search":
-        window = min(value, len(train_texts))
-        longest_train = [train_texts[i] for i in order[:window]]
-        micro, accum, longest, tried, probed_max = find_best_micro(
-            model, tokenizer, longest_train, longest_eval, max_len,
-            value, dtype=dtype)
-        trace = " -> ".join(
-            f"{m} {'OK' if state == 'OK' else 'OOM'}"
-            for m, state in tried)
-        extra = (f" (edge {probed_max}, sustained check passed at {micro})"
-                 if probed_max != micro else "")
-        print(f"Micro search [{trace}] => micro={micro}, accum={accum} "
-              f"(effective={micro * accum} of {value}) at real max length "
-              f"{longest}{extra}.")
-        training["per_device_train_batch_size"] = micro
-        training["gradient_accumulation_steps"] = accum
-        config["_micro_search"] = {
-            "global_batch_size": training["global_batch_size"],
-            "searched_micro": micro,
-            "probed_max": probed_max,
-            "effective_batch_size": micro * accum,
-            "candidates_tried": [list(t) for t in tried],
-        }
-    else:
-        micro = training["per_device_train_batch_size"]
-        longest_train = [train_texts[i] for i in order[:max(1, micro)]]
-        longest = verify_fit(
-            model, tokenizer, longest_train, longest_eval, micro,
-            max_len, dtype=dtype)
-        print(f"Fit OK: micro={micro} at real max length {longest} tokens.")
+    # Build the real config before any Trainer exists: every TrainingArguments
+    # construction resets Accelerate's global state, which would invalidate
+    # the probe Trainer this run is promoted onto.
+    real_args = build_args(config, 1, 1, sft.final_path)
 
-    if args.dry_run:
-        print("DRY-RUN: batch resolved and gated above, exiting.")
-        return
+    session = None
+    trainer = None
+    try:
+        session = ProbeSession.open(probe_trainer, steps=probe_steps)
+        if mode == "search":
+            max_micro = min(value, len(train_dataset))
+            result = find_best_micro(
+                session.run, usable_gb, value, reserve_fraction=reserve,
+                max_micro=max_micro)
+            micro = result["micro"]
+            accum = result["accum"]
+            training["per_device_train_batch_size"] = micro
+            training["gradient_accumulation_steps"] = accum
+            # Persist a single reproducible batch mode.
+            training.pop("global_batch_size", None)
+            trace = " -> ".join(
+                f"{c['micro']} {c['result']}"
+                + (f" ({c['peak_reserved_gb']:.2f} GB)"
+                   if c.get("peak_reserved_gb") is not None else "")
+                for c in result["candidates"])
+            print(f"Micro probe [{trace}] => micro={micro}, accum={accum} "
+                  f"(effective={micro * accum} of {value}) "
+                  f"[limit {result['limit_gb']:.2f} GB = usable "
+                  f"{result['usable_gb']:.2f} GB - {reserve:.0%} reserve].")
+            preflight = _search_preflight(
+                config, model_handler.backend_name, device_total_gb,
+                probe_steps, created, result)
+        else:
+            micro = training["per_device_train_batch_size"]
+            accum = training["gradient_accumulation_steps"]
+            check = check_pinned(
+                session.run, micro, usable_gb, reserve_fraction=reserve)
+            print(f"Fit OK: pinned micro={micro}, accum={accum} at real max "
+                  f"length {config['model']['max_seq_length']} tokens "
+                  f"(probe peak {check['peak_reserved_gb']:.2f} GB, limit "
+                  f"{check['limit_gb']:.2f} GB).")
+            preflight = _fixed_preflight(
+                config, model_handler.backend_name, device_total_gb,
+                probe_steps, created, micro, accum, check)
 
-    # 4. Training + persistence.
-    print("-" * 10 + "Starting training" + "-" * 10)
-    trainer = SFTTrain(config, model, tokenizer, train_dataset, eval_dataset)
-    trainer.train()
+        preflight_path = write_preflight(sft.final_path, preflight)
+        print(f"Preflight report: {preflight_path}")
 
-    print("-" * 10 + "Saving model" + "-" * 10)
-    trainer.save_model()
+        if args.dry_run:
+            print("DRY-RUN: batch resolved and gated above, exiting.")
+            return
 
-    print("Training completed successfully!")
+        # 4. Training + persistence. Promotion happens while the probe
+        # session still owns the Trainer; the real run then takes over.
+        real_args.per_device_train_batch_size = micro
+        real_args.gradient_accumulation_steps = accum
+        promote_trainer(session.trainer, real_args, build_callbacks(config))
+        trainer = session.release_trainer()
+
+        print("-" * 10 + "Starting training" + "-" * 10)
+        sft.train(trainer, preflight=preflight)
+
+        print("-" * 10 + "Saving model" + "-" * 10)
+        sft.save_model()
+
+        print("Training completed successfully!")
+    finally:
+        if session is not None:
+            session.close()
+        close_trainer(trainer)
 
 
 if __name__ == "__main__":

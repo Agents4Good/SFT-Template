@@ -11,14 +11,28 @@ dataset:
     test_size: 0.1
 
 training:
-  # Exactly ONE batch mode. With global_batch_size set (below), main
-  # binary-searches the largest fitting micro in [1, global] by plain
-  # halving and trains one below it; gradient_accumulation_steps =
-  # global // micro (floor), so the effective batch lands at or below
-  # global and is reported. Without it, delete the key and set
-  # per_device_train_batch_size + gradient_accumulation_steps
-  # explicitly to pin them (no search, e.g. micro=4/accum=16).
+  # Exactly ONE batch mode. With global_batch_size set (below) the
+  # largest fitting micro is binary-searched in [1, global]: every
+  # candidate runs a few real Trainer steps at the longest training
+  # shapes (real collator/optimizer/precision/grad-checkpointing),
+  # then one eval forward. A candidate passes only if measured peak
+  # reserved VRAM stays below usable_gb * (1 - vram_reserve_fraction).
+  # gradient_accumulation_steps = global // micro (floor), so the
+  # effective batch lands at or below global and is reported. Without
+  # global_batch_size, set per_device_train_batch_size +
+  # gradient_accumulation_steps to pin them (one fit check, e.g.
+  # micro=4/accum=16). A preflight.json report is written before
+  # training either way. The probed Trainer is reused for the real
+  # run (not rebuilt), so the fit check measures the actual training
+  # state instead of a cold rebuild.
   global_batch_size: 64
+  # Fraction of usable VRAM kept free as a safety margin. 0.10 keeps
+  # ~1.2 GB available on a 12 GB card for allocator fragmentation and
+  # late-run spikes. Lower only deliberately.
+  vram_reserve_fraction: 0.10
+  # Steps per probe. dtensor/compile workspaces and optimizer moments
+  # mostly materialize in the first steps; 3 is enough and cheap.
+  probe_steps: 3
   optim: "adamw_8bit"
   learning_rate: 3.0e-4
   lr_scheduler_type: "cosine"
